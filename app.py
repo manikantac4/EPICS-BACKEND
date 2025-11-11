@@ -1,259 +1,533 @@
-from flask import Flask, request, jsonify, Response
-from datetime import datetime, timedelta
+"""
+Flask IoT backend (fixed daily averages calculation, CSV export removed)
+
+Expect POST /api/sensordata JSON:
+{
+  "mq2_ppm": 17.75,
+  "temperature": 30.4,
+  "humidity": 79.1,
+  "voc_ppm": 244.74,
+  "h2s_ppm": 0.30,
+  "co_ppm": 11.55,
+  "air_quality_percent": 75.5
+}
+
+Env variables (create a .env):
+MONGO_URI="your_mongo_uri"
+FIREBASE_SERVICE_ACCOUNT="path/to/serviceAccountKey.json"
+FCM_DEVICE_TOKEN="your_fcm_device_token"
+OPENWEATHER_API_KEY="your_openweather_api_key"
+"""
+
+from flask import Flask, request, jsonify
+from datetime import datetime, timedelta, timezone
 import threading
 import time
 import os
 import requests
-import firebase_admin
-from firebase_admin import credentials, messaging
+import logging
 from pymongo import MongoClient, ASCENDING
+from dotenv import load_dotenv
+
+# Optional: firebase import guarded because sometimes environments don't have the SDK
+firebase_available = False
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+    firebase_available = True
+except Exception:
+    firebase_available = False
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+load_dotenv()
+
+MONGO_URI = os.getenv('MONGO_URI')
+FIREBASE_SERVICE_ACCOUNT = os.getenv('FIREBASE_SERVICE_ACCOUNT', 'serviceAccountKey.json')
+FCM_DEVICE_TOKEN = os.getenv('FCM_DEVICE_TOKEN', '')
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY', '')
+
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+
+# Monitor thread cooldown (sec)
+NOTIFY_COOLDOWN_SECONDS = int(os.getenv('NOTIFY_COOLDOWN_SECONDS', '60'))
+MONITOR_LOOP_INTERVAL = float(os.getenv('MONITOR_LOOP_INTERVAL', '5'))
+
+# -----------------------------
+# ALERT THRESHOLDS (ppm / percent)
+# Tweak these values to match calibration/requirements.
+# -----------------------------
+THRESHOLDS = {
+    'mq2': { 'moderate': 50.0,  'extreme': 200.0 },   # LPG/Smoke ppm
+    'voc': { 'moderate': 300.0, 'extreme': 1000.0 },  # VOC ppm
+    'h2s': { 'moderate': 0.5,   'extreme': 1.5 },     # H2S ppm (very low thresholds)
+    'co':  { 'moderate': 35.0,  'extreme': 100.0 },   # CO ppm (WHO short-term ~35 ppm concern)
+    'air_quality_percent': { 'bad_threshold': 60.0 }  # percent threshold for "bad"
+}
+
+# -----------------------------
+# LOGGING
+# -----------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger('iot_backend')
 
 # -----------------------------
 # FLASK APP INITIALIZATION
 # -----------------------------
 app = Flask(__name__)
+try:
+    from flask_cors import CORS
+    CORS(app)
+except Exception:
+    pass
 
 # -----------------------------
 # MONGODB CONNECTION (ATLAS)
 # -----------------------------
-MONGO_URI = "mongodb+srv://panduranga1797:17971797@cluster0.cqvn1hp.mongodb.net/?appName=Cluster0"
-client = MongoClient(MONGO_URI)  # consider adding serverSelectionTimeoutMS=5000 in production
-db = client['air_quality_db']          # Database name
-sensor_collection = db['sensor_data']  # For latest readings
-avg_collection = db['daily_average']   # For 3-day averages
-history_collection = db['sensor_history']  # NEW: time-series history
-
-# Ensure index for faster queries on timestamp (create once)
-history_collection.create_index([("timestamp", ASCENDING)])
-# Optional: index by any other field you query frequently, e.g. {"gas_value":1}
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')  # verify connection
+    db = client.get_database()
+    # Collections
+    sensor_collection = db['sensor_snapshot']    # latest single doc (_id=1)
+    avg_collection = db['daily_average_ppm']     # rolling 3-day averages (ppm)
+    history_collection = db['sensor_history_ppm']# time-series history
+    # Indices
+    history_collection.create_index([('timestamp', ASCENDING)])
+    avg_collection.create_index([('date', ASCENDING)])
+    sensor_collection.create_index([('_id', ASCENDING)])
+    logger.info('✅ Connected to MongoDB and indexes ensured')
+except Exception as e:
+    logger.exception('❌ Failed to connect to MongoDB')
+    raise
 
 # -----------------------------
-# FIREBASE INITIALIZATION
+# FIREBASE INITIALIZATION (optional)
 # -----------------------------
-cred = credentials.Certificate("serviceAccountkey.json")
-firebase_admin.initialize_app(cred)
+firebase_initialized = False
+if firebase_available:
+    try:
+        if os.path.exists(FIREBASE_SERVICE_ACCOUNT):
+            cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+            firebase_admin.initialize_app(cred)
+            firebase_initialized = True
+            logger.info('✅ Firebase Admin initialized')
+        else:
+            logger.warning('⚠ Firebase service account file not found: %s', FIREBASE_SERVICE_ACCOUNT)
+    except Exception:
+        logger.exception('❌ Firebase initialization failed; continuing without FCM')
+        firebase_initialized = False
+else:
+    logger.warning('⚠ firebase-admin not installed or import failed; notifications disabled')
 
 # -----------------------------
-# GLOBAL VARIABLES
+# GLOBALS
 # -----------------------------
-latest_alert = {"alert": False, "message": "All clear 👍"}
-priority_order = ["lpg", "co2", "h2s", "voc", "temperature", "humidity"]
+latest_alert = {'alert': False, 'message': 'All clear 👍', 'level': 'Good'}
+priority_order = ["mq2", "co", "h2s", "voc", "temperature", "humidity", "air_quality_percent"]
+monitor_thread = None
+monitor_thread_started = threading.Event()
 
-# Replace with your actual device token
-FCM_DEVICE_TOKEN = "d9opAp5QRkG0gFcOD_kbck:APA91bEUXkhYE1_sxIGH_uOeuw5bMasaGwTUUxrCv19GOTCp427ByQLtsSNRVPfiosnxaMbIAtA76ZVoel0fla7glJqnXt295gjW4W7KbdFXrv0j_ADfpdY"
+# -----------------------------
+# UTILITIES
+# -----------------------------
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def _ensure_tz_aware(dt):
+    """
+    Ensure a datetime is timezone-aware. If naive, assume UTC and set tzinfo=timezone.utc.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def _date_range_from_iso(date_iso):
+    """
+    Given a date string 'YYYY-MM-DD', return (start_dt, end_dt) timezone-aware in UTC
+    representing [date 00:00:00, next_date 00:00:00)
+    """
+    d = datetime.strptime(date_iso, '%Y-%m-%d').date()
+    start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start, end
 
 # -----------------------------
 # FIREBASE NOTIFICATION FUNCTION
 # -----------------------------
+# -----------------------------
+# Gemini (Google Generative) helper
+# -----------------------------
+def call_gemini_for_suggestions(three_day_averages, model=GEMINI_MODEL, api_key=GEMINI_API_KEY, timeout=10):
+    """
+    three_day_averages: list of dicts like returned by /api/viewdailyaverage
+    Returns: dict with raw Gemini JSON (or error)
+    """
+    if not api_key:
+        return {'error': 'GEMINI_API_KEY not configured'}
+
+    # Build a compact prompt: include JSON and ask for suggestions
+    prompt_lines = []
+    prompt_lines.append("You are an assistant that analyzes 3-day indoor air quality summaries and gives:\n"
+                        "- short plain-language summary for each day\n"
+                        "- overall trend (improving/worsening/stable)\n"
+                        "- top 3 recommendations for the user (safety and actions)\n"
+                        "- any sensors/values of concern and why\n")
+    prompt_lines.append("Here are the 3-day daily averages (date, counts, and average ppm/%):")
+    # attach data as a JSON block for clarity
+    prompt_lines.append(json.dumps(three_day_averages, indent=2))
+    prompt_lines.append("\nRespond with a short JSON object containing: summary_by_day (array of {date, summary}), overall_trend, recommendations (array), concerns (array). Also include a short human-readable 'text' field summarizing findings.")
+    prompt_text = "\n\n".join(prompt_lines)
+
+    # Build request body in Gemini generateContent format (simple text contents)
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt_text}
+                ],
+                # role may be omitted or set; docs accept simple content blocks
+            }
+        ],
+        # You can tune model params here if desired
+        "temperature": 0.2,
+        "maxOutputTokens": 512
+    }
+
+    # Use the documented generateContent REST endpoint (v1beta or v1 depending on your access)
+    # Example base: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+    headers = {
+        "Content-Type": "application/json",
+        # Many examples pass the key as query param ?key=API_KEY or via x-goog-api-key header.
+        # We'll send it as an x-goog-api-key header (works with API key auth).
+        "x-goog-api-key": api_key
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        logger.exception("❌ call_gemini_for_suggestions failed")
+        return {"error": str(e), "status_code": getattr(e.response, "status_code", None),
+                "text": getattr(e.response, "text", None)}
+
+# -----------------------------
+# API: Ask Gemini for suggestions based on last 3 days
+# -----------------------------
+@app.route('/api/gemini_suggestions', methods=['GET'])
+def gemini_suggestions():
+    """
+    Returns suggestions from Gemini for the last 3 daily averages.
+    Query params:
+      model (optional) - override default model
+    """
+    try:
+        model = request.args.get('model', GEMINI_MODEL)
+
+        # Fetch last 3 day averages same as /api/viewdailyaverage logic
+        rows_cursor = avg_collection.find({}, {'_id': 0}).sort('date', -1).limit(3)
+        rows = list(rows_cursor)
+        if not rows:
+            return jsonify({'status': 'error', 'message': 'no daily averages available'}), 404
+
+        # We will send the rows directly — keep keys consistent with view_daily_average output
+        # Ensure ordering oldest -> newest might be easier for human reading; reverse if currently desc
+        three_days = list(reversed(rows))  # oldest first
+
+        # Call Gemini
+        model_name = model or GEMINI_MODEL
+        gemini_resp = call_gemini_for_suggestions(three_days, model=model_name)
+
+        # Try to extract a readable text from recommended fields (response shape may differ by model version)
+        # The Gemini REST response commonly includes a top-level 'candidates' or 'outputs' structure.
+        # We'll attempt a safe extraction:
+        human_text = None
+        try:
+            # some docs show top-level 'candidates' with 'content' or 'output' fields
+            if isinstance(gemini_resp, dict):
+                # new style: 'candidates' or 'output' or 'outputs'
+                if 'candidates' in gemini_resp and len(gemini_resp['candidates']) > 0:
+                    # candidate might contain 'content' with 'text' or 'output'
+                    cand = gemini_resp['candidates'][0]
+                    # attempt to find text fields
+                    human_text = cand.get('content', {}).get('text') if isinstance(cand.get('content'), dict) else cand.get('content')
+                    if not human_text:
+                        human_text = cand.get('output') or cand.get('text')
+                elif 'outputs' in gemini_resp and len(gemini_resp['outputs']) > 0:
+                    # outputs often have 'content' -> list -> {'type':'output_text','text': '...'}
+                    out = gemini_resp['outputs'][0]
+                    if isinstance(out.get('content'), list):
+                        for c in out['content']:
+                            if c.get('type') in ('output_text','text'):
+                                human_text = c.get('text')
+                                break
+                elif 'text' in gemini_resp:
+                    human_text = gemini_resp.get('text')
+        except Exception:
+            human_text = None
+
+        return jsonify({
+            'status': 'success',
+            'model_response': gemini_resp,
+            'human_readable': human_text
+        }), 200
+
+    except Exception:
+        logger.exception('❌ gemini_suggestions endpoint failed')
+        return jsonify({'status': 'error', 'message': 'internal error'}), 500
+
+
 def send_fcm_notification(title, body, level):
+    if not firebase_initialized or not FCM_DEVICE_TOKEN:
+        logger.info('ℹ Skipping FCM send (firebase not initialized or token missing)')
+        return
     try:
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
             token=FCM_DEVICE_TOKEN,
             android=messaging.AndroidConfig(
-                priority="high",
+                priority='high',
                 notification=messaging.AndroidNotification(
-                    sound="default",
-                    color="#FF0000" if level == "Extreme" else "#FFA500",
-                ),
+                    sound='default',
+                    color='#FF0000' if level == 'Extreme' else '#FFA500'
+                )
             ),
-            data={"click_action": "FLUTTER_NOTIFICATION_CLICK", "alert_level": level}
+            data={'click_action': 'FLUTTER_NOTIFICATION_CLICK', 'alert_level': level}
         )
         response = messaging.send(message)
-        print(f"✅ FCM Notification sent successfully! ID: {response}")
-    except Exception as e:
-        print("❌ Failed to send FCM Notification:", e)
+        logger.info('✅ FCM Notification sent: %s', response)
+    except Exception:
+        logger.exception('❌ Failed to send FCM Notification')
 
 # -----------------------------
-# INITIALIZE DATABASE DOCUMENTS
+# ALERT EVALUATION (ppm-aware)
+# -----------------------------
+def evaluate_alerts(doc):
+    """
+    doc is expected to contain:
+    mq2_ppm, temperature, humidity, voc_ppm, h2s_ppm, co_ppm, air_quality_percent
+    """
+    alerts = {}
+
+    mq2 = safe_float(doc.get('mq2_ppm', 0.0))
+    temperature = safe_float(doc.get('temperature', 0.0))
+    humidity = safe_float(doc.get('humidity', 0.0))
+    voc = safe_float(doc.get('voc_ppm', 0.0))
+    h2s = safe_float(doc.get('h2s_ppm', 0.0))
+    co = safe_float(doc.get('co_ppm', 0.0))
+    aq_percent = safe_float(doc.get('air_quality_percent', 100.0))
+
+    # MQ-2 (LPG/Smoke)
+    if THRESHOLDS['mq2']['moderate'] < mq2 <= THRESHOLDS['mq2']['extreme']:
+        alerts['mq2'] = ('Moderate', f'⚠ MODERATE: LPG/Smoke detected {mq2:.2f} ppm — ventilate.')
+    elif mq2 > THRESHOLDS['mq2']['extreme']:
+        alerts['mq2'] = ('Extreme', f'🚨 EXTREME: LPG/Smoke: {mq2:.2f} ppm — take immediate action!')
+
+    # CO (MQ-7)
+    if THRESHOLDS['co']['moderate'] < co <= THRESHOLDS['co']['extreme']:
+        alerts['co'] = ('Moderate', f'⚠ MODERATE: CO rising {co:.2f} ppm — ventilate.')
+    elif co > THRESHOLDS['co']['extreme']:
+        alerts['co'] = ('Extreme', f'🚨 EXTREME: High CO {co:.2f} ppm — danger!')
+
+    # H2S (MQ-136) - small ppm values are dangerous
+    if THRESHOLDS['h2s']['moderate'] < h2s <= THRESHOLDS['h2s']['extreme']:
+        alerts['h2s'] = ('Moderate', f'⚠ MODERATE: H2S detected {h2s:.3f} ppm.')
+    elif h2s > THRESHOLDS['h2s']['extreme']:
+        alerts['h2s'] = ('Extreme', f'🚨 EXTREME: High H2S {h2s:.3f} ppm — evacuate area!')
+
+    # VOC
+    if THRESHOLDS['voc']['moderate'] < voc <= THRESHOLDS['voc']['extreme']:
+        alerts['voc'] = ('Moderate', f'⚠ MODERATE: VOCs {voc:.2f} ppm — ventilate.')
+    elif voc > THRESHOLDS['voc']['extreme']:
+        alerts['voc'] = ('Extreme', f'🚨 EXTREME: VOC level critical {voc:.2f} ppm!')
+
+    # Temperature
+    if 32.0 < temperature <= 35.0:
+        alerts['temperature'] = ('Moderate', '🌡 MODERATE: Slightly high temperature.')
+    elif temperature > 35.0:
+        alerts['temperature'] = ('Extreme', '🔥 EXTREME: Temperature too high!')
+
+    # Humidity
+    if (70.0 < humidity <= 80.0) or (20.0 < humidity <= 30.0):
+        alerts['humidity'] = ('Moderate', '💧 MODERATE: Humidity slightly off.')
+    elif humidity > 90.0 or humidity < 20.0:
+        alerts['humidity'] = ('Extreme', '💧 EXTREME: Humidity critical!')
+
+    # Air Quality percent (user-facing)
+    if aq_percent < THRESHOLDS['air_quality_percent']['bad_threshold']:
+        alerts['air_quality_percent'] = ('Moderate', f'⚠ Air Quality degrading: {aq_percent:.1f}%')
+
+    # Resolve by priority
+    for key in priority_order:
+        if key in alerts:
+            level, message = alerts[key]
+            return True, level, message
+    return False, 'Good', '✅ Air Quality: GOOD'
+
+# -----------------------------
+# DATABASE INITIALIZATION
 # -----------------------------
 def initialize_db():
-    if sensor_collection.count_documents({}) == 0:
-        sensor_collection.insert_one({
-            "_id": 1,
-            "gas_value": 0, "temperature": 0, "humidity": 0,
-            "voc": 0, "h2s": 0, "co2": 0, "voc_percent": 0,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        print("✅ MongoDB ready with seven-sensor structure!")
+    try:
+        if sensor_collection.count_documents({}) == 0:
+            sensor_collection.insert_one({
+                '_id': 1,
+                'mq2_ppm': 0.0,
+                'temperature': 0.0,
+                'humidity': 0.0,
+                'voc_ppm': 0.0,
+                'h2s_ppm': 0.0,
+                'co_ppm': 0.0,
+                'air_quality_percent': 100.0,
+                # store timezone-aware ISO timestamp (UTC)
+                'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %z')
+            })
+            logger.info('✅ MongoDB ready with initial sensor document (ppm fields)')
+    except Exception:
+        logger.exception('❌ initialize_db failed')
 
 # -----------------------------
 # API: Receive Sensor Data
 # -----------------------------
 @app.route('/api/sensordata', methods=['POST'])
 def receive_data():
-    data = request.get_json()
-    print("📩 Received Data:", data)
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({'status': 'error', 'message': 'Invalid JSON'}), 400
 
-    # Extract with defaults
-    gas_value = float(data.get('gas_value', 0))
-    temperature = float(data.get('temperature', 0))
-    humidity = float(data.get('humidity', 0))
-    voc = float(data.get('voc', 0))
-    h2s = float(data.get('h2s', 0))
-    co2 = float(data.get('co2', 0))
-    voc_percent = float(data.get('voc_percent', 0))
-    timestamp = datetime.utcnow()  # store as datetime for better queries
+    logger.info('📩 Received data: %s', data)
 
-    # -----------------------------
-    # Update Latest Sensor Data (single doc)
-    # -----------------------------
-    sensor_collection.update_one(
-        {"_id": 1},
-        {"$set": {
-            "gas_value": gas_value, "temperature": temperature, "humidity": humidity,
-            "voc": voc, "h2s": h2s, "co2": co2, "voc_percent": voc_percent,
-            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S")
-        }},
-        upsert=True
-    )
+    # Parse and coerce numeric values safely
+    mq2_ppm = safe_float(data.get('mq2_ppm', data.get('gas_value', 0.0)))
+    temperature = safe_float(data.get('temperature', 0.0))
+    humidity = safe_float(data.get('humidity', 0.0))
+    voc_ppm = safe_float(data.get('voc_ppm', data.get('voc', 0.0)))
+    h2s_ppm = safe_float(data.get('h2s_ppm', data.get('h2s', 0.0)))
+    co_ppm = safe_float(data.get('co_ppm', data.get('co', 0.0)))
+    air_quality_percent = safe_float(data.get('air_quality_percent', data.get('voc_percent', 0.0)))
+    timestamp = datetime.now(timezone.utc)  # timezone-aware UTC
 
-    # -----------------------------
-    # INSERT into HISTORY collection (every reading)
-    # -----------------------------
+    # Update latest doc (atomic upsert)
+    try:
+        sensor_collection.update_one(
+            {'_id': 1},
+            {'$set': {
+                'mq2_ppm': mq2_ppm,
+                'temperature': temperature,
+                'humidity': humidity,
+                'voc_ppm': voc_ppm,
+                'h2s_ppm': h2s_ppm,
+                'co_ppm': co_ppm,
+                'air_quality_percent': air_quality_percent,
+                # save a human-readable UTC timestamp with offset
+                'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S %z')
+            }},
+            upsert=True
+        )
+    except Exception:
+        logger.exception('❌ Failed to update latest sensor document')
+
+    # Insert into history (store tz-aware datetime)
     try:
         history_doc = {
-            "gas_value": gas_value,
-            "temperature": temperature,
-            "humidity": humidity,
-            "voc": voc,
-            "h2s": h2s,
-            "co2": co2,
-            "voc_percent": voc_percent,
-            "timestamp": timestamp  # datetime object
+            'mq2_ppm': mq2_ppm,
+            'temperature': temperature,
+            'humidity': humidity,
+            'voc_ppm': voc_ppm,
+            'h2s_ppm': h2s_ppm,
+            'co_ppm': co_ppm,
+            'air_quality_percent': air_quality_percent,
+            'timestamp': timestamp  # tz-aware datetime
         }
         history_collection.insert_one(history_doc)
-    except Exception as e:
-        print("❌ Failed to insert into history_collection:", e)
+    except Exception:
+        logger.exception('❌ Failed to insert history doc')
 
-    # -----------------------------
-    # Update 3-Day Daily Average Table
-    # -----------------------------
-    update_daily_average({
-        "gas_value": gas_value,
-        "temperature": temperature,
-        "humidity": humidity,
-        "voc": voc,
-        "h2s": h2s,
-        "co2": co2,
-        "voc_percent": voc_percent
-    })
+    # Update daily averages
+    try:
+        update_daily_average({
+            'mq2_ppm': mq2_ppm,
+            'temperature': temperature,
+            'humidity': humidity,
+            'voc_ppm': voc_ppm,
+            'h2s_ppm': h2s_ppm,
+            'co_ppm': co_ppm,
+            'air_quality_percent': air_quality_percent
+        })
+    except Exception:
+        logger.exception('❌ update_daily_average failed')
 
-    print(f"✅ Updated (latest + history): MQ2={gas_value}, Temp={temperature}, Hum={humidity}, VOC={voc}, H2S={h2s}, CO2={co2}")
-    return jsonify({"status": "success", "message": "Data updated successfully"}), 200
+    return jsonify({'status': 'success', 'message': 'Data updated successfully'}), 200
 
 # -----------------------------
 # API: Get Latest Sensor Data
 # -----------------------------
 @app.route('/api/viewdata', methods=['GET'])
 def view_data():
-    row = sensor_collection.find_one({"_id": 1}, {"_id": 0})
-    return jsonify(row if row else {})
+    try:
+        row = sensor_collection.find_one({'_id': 1}, {'_id': 0})
+        return jsonify(row if row else {}), 200
+    except Exception:
+        logger.exception('❌ view_data failed')
+        return jsonify({}), 500
 
 # -----------------------------
 # API: Get Latest Alert
 # -----------------------------
 @app.route('/api/alertstatus', methods=['GET'])
 def get_alert():
-    return jsonify(latest_alert)
-
-# -----------------------------
-# PRIORITY ALERT FUNCTION
-# -----------------------------
-def evaluate_alerts(row):
-    alerts = {}
-    gas_value = row.get('gas_value', 0)
-    temperature = row.get('temperature', 0)
-    humidity = row.get('humidity', 0)
-    voc = row.get('voc', 0)
-    h2s = row.get('h2s', 0)
-    co2 = row.get('co2', 0)
-
-    # LPG
-    if 1000 < gas_value <= 1500:
-        alerts["lpg"] = ("Moderate", "⚠️ MODERATE: LPG presence detected, ensure ventilation.")
-    elif gas_value > 1500:
-        alerts["lpg"] = ("Extreme", "🚨 EXTREME: LPG leak detected, act immediately!")
-
-    # CO2
-    if 1000 < co2 <= 1500:
-        alerts["co2"] = ("Moderate", "⚠️ MODERATE: CO₂ rising, open windows.")
-    elif co2 > 1500:
-        alerts["co2"] = ("Extreme", "🚨 EXTREME: Dangerous CO₂ level! Ventilate now!")
-
-    # H2S
-    if 1800 < h2s <= 2400:
-        alerts["h2s"] = ("Moderate", "⚠️ MODERATE: Low H₂S detected.")
-    elif h2s > 2400:
-        alerts["h2s"] = ("Extreme", "🚨 EXTREME: High H₂S detected! Possible leak!")
-
-    # VOC
-    if 2500 < voc <= 2900:
-        alerts["voc"] = ("Moderate", "⚠️ MODERATE: VOCs increasing, ventilate area.")
-    elif voc > 2900:
-        alerts["voc"] = ("Extreme", "🚨 EXTREME: VOC level critical!")
-
-    # Temperature
-    if 32 < temperature <= 35:
-        alerts["temperature"] = ("Moderate", "🌡️ MODERATE: Slightly high room temperature.")
-    elif temperature > 35:
-        alerts["temperature"] = ("Extreme", "🔥 EXTREME: Temperature too high!")
-
-    # Humidity
-    if (70 < humidity <= 80) or (20 < humidity <= 30):
-        alerts["humidity"] = ("Moderate", "💧 MODERATE: Humidity slightly off.")
-    elif humidity > 90 or humidity < 20:
-        alerts["humidity"] = ("Extreme", "💧 EXTREME: Humidity critical!")
-
-    for key in priority_order:
-        if key in alerts:
-            return True, alerts[key][0], alerts[key][1]
-    return False, "Good", "✅ Air Quality: GOOD"
+    return jsonify(latest_alert), 200
 
 # -----------------------------
 # BACKGROUND MONITOR LOOP
 # -----------------------------
-def monitor_loop(notify_cooldown_seconds=60):
-    """
-    Monitor latest document and send Firebase notifications when alert changes.
-    notify_cooldown_seconds: minimum seconds between two FCM sends for the same message.
-    """
+def monitor_loop(notify_cooldown_seconds=NOTIFY_COOLDOWN_SECONDS, interval=MONITOR_LOOP_INTERVAL):
     global latest_alert
     last_sent_message = None
-    last_sent_time = datetime.min
+    # timezone-aware minimum time
+    last_sent_time = datetime.min.replace(tzinfo=timezone.utc)
+
+    logger.info('🔁 monitor_loop started (interval=%ss)', interval)
 
     while True:
         try:
-            row = sensor_collection.find_one({"_id": 1})
-        except Exception as e:
-            # Don't let DB/network errors crash the thread
-            print("⚠️ monitor_loop DB error (will retry):", e)
+            row = sensor_collection.find_one({'_id': 1})
+        except Exception:
+            logger.exception('⚠ monitor_loop DB read error')
             time.sleep(5)
             continue
 
         if row:
             alert_flag, level, msg = evaluate_alerts(row)
-            latest_alert = {"alert": alert_flag, "level": level, "message": msg}
-            print(f"🔔 [Monitor] {msg}")
+            latest_alert = {'alert': alert_flag, 'level': level, 'message': msg}
+            logger.info('🔔 [Monitor] %s', msg)
 
-            # Only attempt notification if alert is True
             if alert_flag:
-                now = datetime.utcnow()
-                # send if message changed OR cooldown expired
+                now = datetime.now(timezone.utc)
                 cooldown_ok = (now - last_sent_time) >= timedelta(seconds=notify_cooldown_seconds)
                 if (msg != last_sent_message) or cooldown_ok:
                     try:
-                        send_fcm_notification("Air Quality Alert", msg, level)
+                        send_fcm_notification('Air Quality Alert', msg, level)
                         last_sent_message = msg
                         last_sent_time = now
-                        print(f"✅ Notification sent (message='{msg[:60]}') at {now}")
-                    except Exception as e:
-                        print("❌ Failed to send FCM inside monitor_loop:", e)
+                        logger.info('✅ Notification sent (message=%s)', msg[:80])
+                    except Exception:
+                        logger.exception('❌ Failed to send notification in monitor_loop')
         else:
-            # No row found: keep trying
-            print("ℹ️ monitor_loop: no latest sensor document found; retrying...")
+            logger.info('ℹ monitor_loop: no latest sensor doc found yet')
 
-        time.sleep(5)
+        time.sleep(interval)
 
 # -----------------------------
 # WEATHER API
@@ -262,174 +536,283 @@ def monitor_loop(notify_cooldown_seconds=60):
 def get_weather():
     lat = request.args.get('lat', '16.4821')
     lon = request.args.get('lon', '80.6914')
-    api_key = "c6b3ba16b0dd5b70beed998a1ec6b3c8"
-    url = "http://api.openweathermap.org/data/2.5/air_pollution"
-    params = {"lat": lat, "lon": lon, "appid": api_key}
-    response = requests.get(url, params=params)
-    return jsonify(response.json()) if response.status_code == 200 else jsonify({"error": "Failed to fetch data"}), response.status_code
+    api_key = OPENWEATHER_API_KEY
+    if not api_key:
+        return jsonify({'error': 'OpenWeather API key not configured'}), 400
+
+    url = 'http://api.openweathermap.org/data/2.5/air_pollution'
+    params = {'lat': lat, 'lon': lon, 'appid': api_key}
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        print('🌤 Weather API response:', response.json())
+        return jsonify(response.json()), 200
+    except Exception:
+        logger.exception('❌ get_weather failed')
+        return jsonify({'error': 'Failed to fetch weather/air pollution data'}), 500
 
 # -----------------------------
-# UPDATE DAILY AVERAGE VALUES
+# UPDATE DAILY AVERAGE VALUES (ppm-aware)
+# Keeps rolling latest 3 days
+# Now stores computed averages directly in MongoDB
 # -----------------------------
 def update_daily_average(data):
-    today = datetime.now().strftime("%Y-%m-%d")
-    existing = avg_collection.find_one({"date": today})
+    # use timezone-aware current date (UTC)
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-    if existing:
-        avg_collection.update_one(
-            {"date": today},
-            {"$inc": {
-                "gas_value_sum": data['gas_value'],
-                "temperature_sum": data['temperature'],
-                "humidity_sum": data['humidity'],
-                "voc_sum": data['voc'],
-                "h2s_sum": data['h2s'],
-                "co2_sum": data['co2'],
-                "voc_percent_sum": data['voc_percent'],
-                "count": 1
-            }}
+    # ensure numeric values
+    mq2 = safe_float(data.get('mq2_ppm', 0.0))
+    temperature = safe_float(data.get('temperature', 0.0))
+    humidity = safe_float(data.get('humidity', 0.0))
+    voc = safe_float(data.get('voc_ppm', 0.0))
+    h2s = safe_float(data.get('h2s_ppm', 0.0))
+    co = safe_float(data.get('co_ppm', 0.0))
+    aq = safe_float(data.get('air_quality_percent', 0.0))
+
+    # Atomic upsert: increment sums and count, set date on insert
+    try:
+        result = avg_collection.update_one(
+            {'date': today},
+            {
+                '$inc': {
+                    'mq2_sum': mq2,
+                    'temperature_sum': temperature,
+                    'humidity_sum': humidity,
+                    'voc_sum': voc,
+                    'h2s_sum': h2s,
+                    'co_sum': co,
+                    'air_quality_sum': aq,
+                    'count': 1
+                },
+                '$setOnInsert': {
+                    'date': today
+                }
+            },
+            upsert=True
         )
-    else:
-        avg_collection.insert_one({
-            "date": today,
-            "gas_value_sum": data['gas_value'],
-            "temperature_sum": data['temperature'],
-            "humidity_sum": data['humidity'],
-            "voc_sum": data['voc'],
-            "h2s_sum": data['h2s'],
-            "co2_sum": data['co2'],
-            "voc_percent_sum": data['voc_percent'],
-            "count": 1
-        })
+        
+        # After updating sums, compute and store the actual averages
+        doc = avg_collection.find_one({'date': today})
+        if doc and doc.get('count', 0) > 0:
+            count = doc['count']
+            avg_collection.update_one(
+                {'date': today},
+                {'$set': {
+                    'avg_mq2_ppm': round(doc.get('mq2_sum', 0.0) / count, 3),
+                    'avg_temperature': round(doc.get('temperature_sum', 0.0) / count, 2),
+                    'avg_humidity': round(doc.get('humidity_sum', 0.0) / count, 2),
+                    'avg_voc_ppm': round(doc.get('voc_sum', 0.0) / count, 3),
+                    'avg_h2s_ppm': round(doc.get('h2s_sum', 0.0) / count, 4),
+                    'avg_co_ppm': round(doc.get('co_sum', 0.0) / count, 3),
+                    'avg_air_quality_percent': round(doc.get('air_quality_sum', 0.0) / count, 2)
+                }}
+            )
+    except Exception:
+        logger.exception('❌ update_daily_average: failed to upsert')
 
-    # Keep only latest 3 days
-    all_docs = list(avg_collection.find().sort("date", -1))
-    if len(all_docs) > 3:
-        for doc in all_docs[3:]:
-            avg_collection.delete_one({"_id": doc["_id"]})
+    # Cleanup keep only latest 3 days (do this safely)
+    try:
+        all_docs = list(avg_collection.find().sort('date', -1))
+        if len(all_docs) > 3:
+            for doc in all_docs[3:]:
+                try:
+                    avg_collection.delete_one({'_id': doc['_id']})
+                except Exception:
+                    logger.exception('⚠ Failed to delete old average doc %s', doc.get('_id'))
+    except Exception:
+        logger.exception('⚠ Failed to cleanup old averages')
 
 # -----------------------------
-# API: Get Last 3 Days Average Data
+# API: Get Last 3 Days Average Data (FIXED: Returns actual averages, not sums)
 # -----------------------------
 @app.route('/api/viewdailyaverage', methods=['GET'])
 def view_daily_average():
-    rows = list(avg_collection.find({}, {"_id": 0}).sort("date", -1))
-    averages = []
-    for row in rows:
-        count = row.get('count', 1)
-        averages.append({
-            "date": row['date'],
-            "avg_gas_value": round(row['gas_value_sum'] / count, 2),
-            "avg_temperature": round(row['temperature_sum'] / count, 2),
-            "avg_humidity": round(row['humidity_sum'] / count, 2),
-            "avg_voc": round(row['voc_sum'] / count, 2),
-            "avg_h2s": round(row['h2s_sum'] / count, 2),
-            "avg_co2": round(row['co2_sum'] / count, 2),
-            "avg_voc_percent": round(row['voc_percent_sum'] / count, 2)
-        })
-    return jsonify(averages)
+    """
+    Return last 3 days of daily averages.
+    Computes averages by dividing stored sums by count.
+    If count is missing/zero for a date, fallback to compute from history_collection.
+    """
+    try:
+        rows_cursor = avg_collection.find({}, {'_id': 0}).sort('date', -1).limit(3)
+        rows = list(rows_cursor)
+        averages = []
+
+        for row in rows:
+            date_str = row.get('date')
+            count = int(row.get('count', 0))
+
+            if count > 0:
+                # FIXED: Compute averages by dividing sums by count
+                averages.append({
+                    'date': date_str,
+                    'avg_mq2_ppm': round(row.get('mq2_sum', 0.0) / count, 3),
+                    'avg_temperature': round(row.get('temperature_sum', 0.0) / count, 2),
+                    'avg_humidity': round(row.get('humidity_sum', 0.0) / count, 2),
+                    'avg_voc_ppm': round(row.get('voc_sum', 0.0) / count, 3),
+                    'avg_h2s_ppm': round(row.get('h2s_sum', 0.0) / count, 4),
+                    'avg_co_ppm': round(row.get('co_sum', 0.0) / count, 3),
+                    'avg_air_quality_percent': round(row.get('air_quality_sum', 0.0) / count, 2),
+                    'count': count
+                })
+            else:
+                # fallback to compute the averages from history (safe)
+                if not date_str:
+                    continue
+                start_dt, end_dt = _date_range_from_iso(date_str)
+                # aggregation to compute averages and count
+                pipeline = [
+                    {'$match': {'timestamp': {'$gte': start_dt, '$lt': end_dt}}},
+                    {'$group': {
+                        '_id': None,
+                        'avg_mq2_ppm': {'$avg': '$mq2_ppm'},
+                        'avg_temperature': {'$avg': '$temperature'},
+                        'avg_humidity': {'$avg': '$humidity'},
+                        'avg_voc_ppm': {'$avg': '$voc_ppm'},
+                        'avg_h2s_ppm': {'$avg': '$h2s_ppm'},
+                        'avg_co_ppm': {'$avg': '$co_ppm'},
+                        'avg_air_quality_percent': {'$avg': '$air_quality_percent'},
+                        'count': {'$sum': 1}
+                    }}
+                ]
+                agg = list(history_collection.aggregate(pipeline))
+                if agg:
+                    a = agg[0]
+                    c = int(a.get('count', 0)) or 0
+                    averages.append({
+                        'date': date_str,
+                        'avg_mq2_ppm': round(a.get('avg_mq2_ppm', 0.0) or 0.0, 3),
+                        'avg_temperature': round(a.get('avg_temperature', 0.0) or 0.0, 2),
+                        'avg_humidity': round(a.get('avg_humidity', 0.0) or 0.0, 2),
+                        'avg_voc_ppm': round(a.get('avg_voc_ppm', 0.0) or 0.0, 3),
+                        'avg_h2s_ppm': round(a.get('avg_h2s_ppm', 0.0) or 0.0, 4),
+                        'avg_co_ppm': round(a.get('avg_co_ppm', 0.0) or 0.0, 3),
+                        'avg_air_quality_percent': round(a.get('avg_air_quality_percent', 0.0) or 0.0, 2),
+                        'count': c
+                    })
+                else:
+                    # no history found for that date
+                    averages.append({
+                        'date': date_str,
+                        'avg_mq2_ppm': 0.0,
+                        'avg_temperature': 0.0,
+                        'avg_humidity': 0.0,
+                        'avg_voc_ppm': 0.0,
+                        'avg_h2s_ppm': 0.0,
+                        'avg_co_ppm': 0.0,
+                        'avg_air_quality_percent': 0.0,
+                        'count': 0
+                    })
+
+        return jsonify(averages), 200
+    except Exception:
+        logger.exception('❌ view_daily_average failed')
+        return jsonify([]), 500
 
 # -----------------------------
-# NEW: View history (last N records)
+# View history (last N records)
 # -----------------------------
 @app.route('/api/viewhistory', methods=['GET'])
 def view_history():
     try:
         limit = int(request.args.get('limit', 100))
-    except:
+    except Exception:
         limit = 100
-    cursor = history_collection.find().sort("timestamp", -1).limit(limit)
-    data = []
-    for doc in cursor:
-        data.append({
-            "gas_value": doc.get("gas_value", 0),
-            "temperature": doc.get("temperature", 0),
-            "humidity": doc.get("humidity", 0),
-            "voc": doc.get("voc", 0),
-            "h2s": doc.get("h2s", 0),
-            "co2": doc.get("co2", 0),
-            "voc_percent": doc.get("voc_percent", 0),
-            "timestamp": doc.get("timestamp").strftime("%Y-%m-%d %H:%M:%S") if doc.get("timestamp") else ""
-        })
-    return jsonify(data)
-
-# -----------------------------
-# NEW: Export CSV for training
-# Example: /api/exportcsv?days=3&limit=10000
-# -----------------------------
-@app.route('/api/exportcsv', methods=['GET'])
-def export_csv():
     try:
-        days = int(request.args.get('days', 3))
-    except:
-        days = 3
-    try:
-        limit = int(request.args.get('limit', 10000))
-    except:
-        limit = 10000
-
-    start_time = datetime.utcnow() - timedelta(days=days)
-    cursor = history_collection.find({"timestamp": {"$gte": start_time}}).sort("timestamp", ASCENDING).limit(limit)
-
-    # Build CSV in memory
-    from io import StringIO
-    import csv
-    output = StringIO()
-    writer = csv.writer(output)
-    # header (choose fields you need for training)
-    writer.writerow(["timestamp", "gas_value", "temperature", "humidity", "voc", "h2s", "co2", "voc_percent"])
-
-    rows = 0
-    for doc in cursor:
-        ts = doc.get("timestamp")
-        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else ""
-        writer.writerow([
-            ts_str,
-            doc.get("gas_value", ""),
-            doc.get("temperature", ""),
-            doc.get("humidity", ""),
-            doc.get("voc", ""),
-            doc.get("h2s", ""),
-            doc.get("co2", ""),
-            doc.get("voc_percent", "")
-        ])
-        rows += 1
-
-    output.seek(0)
-    csv_data = output.getvalue()
-    output.close()
-
-    filename = f"sensor_history_{days}d_{rows}rows.csv"
-    headers = {
-        "Content-Disposition": f"attachment; filename={filename}"
-    }
-    return Response(csv_data, mimetype="text/csv", headers=headers)
+        cursor = history_collection.find().sort('timestamp', -1).limit(limit)
+        data_out = []
+        for doc in cursor:
+            ts = doc.get('timestamp')
+            ts = _ensure_tz_aware(ts)
+            ts_str = ts.strftime('%Y-%m-%d %H:%M:%S %z') if ts else ''
+            data_out.append({
+                'mq2_ppm': doc.get('mq2_ppm', 0.0),
+                'temperature': doc.get('temperature', 0.0),
+                'humidity': doc.get('humidity', 0.0),
+                'voc_ppm': doc.get('voc_ppm', 0.0),
+                'h2s_ppm': doc.get('h2s_ppm', 0.0),
+                'co_ppm': doc.get('co_ppm', 0.0),
+                'air_quality_percent': doc.get('air_quality_percent', 0.0),
+                'timestamp': ts_str
+            })
+        return jsonify(data_out), 200
+    except Exception:
+        logger.exception('❌ view_history failed')
+        return jsonify([]), 500
 
 # -----------------------------
-# MAIN ENTRY
+# Maintenance endpoint: recompute daily averages from history
+# Useful to repair counts/sums if previous logic was incorrect
+# -----------------------------
+@app.route('/api/recompute_daily_averages', methods=['POST'])
+def recompute_daily_averages():
+    """
+    Recompute and overwrite daily_average_ppm documents for the last N days using history_collection.
+    Body: {"days": 7}  (optional, default 7)
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        days = int(body.get('days', 7))
+    except Exception:
+        days = 7
+
+    try:
+        now = datetime.now(timezone.utc)
+        for i in range(days):
+            day = now - timedelta(days=i)
+            date_str = day.strftime('%Y-%m-%d')
+            start_dt, end_dt = _date_range_from_iso(date_str)
+
+            pipeline = [
+                {'$match': {'timestamp': {'$gte': start_dt, '$lt': end_dt}}},
+                {'$group': {
+                    '_id': None,
+                    'mq2_sum': {'$sum': '$mq2_ppm'},
+                    'temperature_sum': {'$sum': '$temperature'},
+                    'humidity_sum': {'$sum': '$humidity'},
+                    'voc_sum': {'$sum': '$voc_ppm'},
+                    'h2s_sum': {'$sum': '$h2s_ppm'},
+                    'co_sum': {'$sum': '$co_ppm'},
+                    'air_quality_sum': {'$sum': '$air_quality_percent'},
+                    'count': {'$sum': 1}
+                }}
+            ]
+            agg = list(history_collection.aggregate(pipeline))
+            if agg and agg[0].get('count', 0) > 0:
+                doc = agg[0]
+                # upsert the sums and count
+                avg_collection.update_one(
+                    {'date': date_str},
+                    {'$set': {
+                        'mq2_sum': float(doc.get('mq2_sum', 0.0)),
+                        'temperature_sum': float(doc.get('temperature_sum', 0.0)),
+                        'humidity_sum': float(doc.get('humidity_sum', 0.0)),
+                        'voc_sum': float(doc.get('voc_sum', 0.0)),
+                        'h2s_sum': float(doc.get('h2s_sum', 0.0)),
+                        'co_sum': float(doc.get('co_sum', 0.0)),
+                        'air_quality_sum': float(doc.get('air_quality_sum', 0.0)),
+                        'count': int(doc.get('count', 0))
+                    }},
+                    upsert=True
+                )
+            else:
+                # remove any existing doc if no history for that date
+                avg_collection.delete_one({'date': date_str})
+
+        return jsonify({'status': 'success', 'message': f'recomputed last {days} days'}), 200
+    except Exception:
+        logger.exception('❌ recompute_daily_averages failed')
+        return jsonify({'status': 'error', 'message': 'recompute failed'}), 500
+# -----------------------------
+# MAIN
 # -----------------------------
 if __name__ == '__main__':
-    # Initialize DB etc.
     initialize_db()
 
-    # When Flask debug=True, the reloader runs the script twice (parent + child).
-    # The actual app runs in the child process with WERKZEUG_RUN_MAIN == "true".
-    # We start the monitor thread only in that child (or when reloader is disabled).
-    should_start_monitor = True
-    # If the dev server reloader is enabled, only start monitor in child process
-    if os.environ.get("WERKZEUG_RUN_MAIN") is not None:
-        # child process when reloader is active
-        should_start_monitor = True
-    else:
-        # when not using reloader, still start monitor
-        should_start_monitor = True
-
-    # Alternative: to avoid any reloader-related doubled processes, you can set use_reloader=False below.
-    if should_start_monitor:
+    # Start monitor thread only once
+    if not monitor_thread_started.is_set():
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         monitor_thread.start()
-        print("✅ monitor thread started.")
+        monitor_thread_started.set()
+        logger.info('✅ monitor thread started')
 
-    # Run Flask. If you still get WinError 10038, try turning off reloader:
-    # app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')), debug=True)
