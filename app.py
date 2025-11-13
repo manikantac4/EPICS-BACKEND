@@ -27,6 +27,8 @@ from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, timezone, time as dt_time
 import threading
 import time
+import math
+import joblib
 import os
 import requests
 import logging
@@ -36,7 +38,12 @@ import pandas as pd
 from google import genai
 from pymongo import MongoClient, ASCENDING
 from dotenv import load_dotenv
-
+from ml.co_predictor import predict_co_api
+from ml.mq2_predictor import predict_mq2_api
+from ml.voc_predictor import predict_voc_api
+from ml.h2s_predictor import predict_h2s_api
+from ml.humidity_predictor import predict_humidity_api
+from ml.temperature import predict_temperature_api
 # APScheduler for scheduled notifications
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
@@ -284,211 +291,32 @@ def _date_range_from_iso(date_iso):
     end = start + timedelta(days=1)
     return start, end
 
-MODEL_PATH = os.path.join("temp_model", "temp_final.keras")   # path to your .keras model
-INPUT_SCALER_PATH = os.path.join("temp_model", "input_scaler.joblib")
-TARGET_SCALER_PATH = os.path.join("temp_model", "target_scaler.joblib")
-
-SAMPLE_INTERVAL_MIN = 2   # same as training
-LOOKBACK = 60             # same as training
-MODEL_HORIZON = 15        # the horizon (in steps) the model was trained for (e.g., 15 -> 30 minutes)
-FEATURE_COLS = ['temperature', 'temperature_delta1', 'temperature_rm5', 'sin_hour', 'cos_hour']
-TIMESTAMP_COL = 'timestamp'
-TARGET = 'temperature'
-
-# Load model and scalers once
-_pred_model = None
-_input_scaler = None
-_target_scaler = None
-#MODEL CODES
-def _load_artifacts():
-    global _pred_model, _input_scaler, _target_scaler
-    if _pred_model is None:
-        _pred_model = load_model(MODEL_PATH)
-    if _input_scaler is None:
-        _input_scaler = joblib.load(INPUT_SCALER_PATH)
-    if _target_scaler is None:
-        _target_scaler = joblib.load(TARGET_SCALER_PATH)
-    return _pred_model, _input_scaler, _target_scaler
-
-# Preprocess raw timestamp+temperature -> resampled df with engineered features
-def preprocess_raw_temperature_df(df_raw):
-    df = df_raw.copy()
-    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL])
-    df = df.sort_values(TIMESTAMP_COL).reset_index(drop=True)
-
-    # set index and resample to fixed interval, interpolate missing
-    df = df.set_index(TIMESTAMP_COL).resample(f"{SAMPLE_INTERVAL_MIN}T").mean().interpolate('time')
-
-    # smoothing median filter (as training)
-    df[TARGET] = df[TARGET].rolling(3, center=True, min_periods=1).median()
-
-    # features
-    df[f'{TARGET}_delta1'] = df[TARGET].diff().fillna(0)
-    df[f'{TARGET}_rm5'] = df[TARGET].rolling(5, min_periods=1).mean()
-
-    # cyclical time
-    dt_index = df.index.to_series()
-    hour = dt_index.dt.hour + dt_index.dt.minute / 60.0
-    df['sin_hour'] = np.sin(2 * np.pi * hour / 24.0)
-    df['cos_hour'] = np.cos(2 * np.pi * hour / 24.0)
-
-    df = df.reset_index()
-    return df
-
-# Helper: create next-step features row given last window and predicted temperature
-def make_next_row_from_prediction(last_window_df, new_timestamp, predicted_temp):
-    """
-    last_window_df: pandas DataFrame of the last LOOKBACK rows (in original feature/column layout)
-    new_timestamp: pd.Timestamp for the synthetic next row
-    predicted_temp: float, predicted temperature (real units)
-    Returns: dict of features matching FEATURE_COLS for appended row
-    """
-    # last real temperatures for rolling computations
-    temps = list(last_window_df['temperature'].values)
-    # compute delta
-    last_temp = temps[-1]
-    delta1 = predicted_temp - last_temp
-    # compute rm5 using up to last 4 values + predicted
-    last_for_rm = temps[-4:] if len(temps) >= 4 else temps
-    rm5_vals = last_for_rm + [predicted_temp]
-    rm5 = float(np.mean(rm5_vals))
-
-    # cyclical time
-    hour = new_timestamp.hour + new_timestamp.minute / 60.0
-    sin_hour = float(np.sin(2 * np.pi * hour / 24.0))
-    cos_hour = float(np.cos(2 * np.pi * hour / 24.0))
-
-    return {
-        'timestamp': new_timestamp,
-        'temperature': float(predicted_temp),
-        'temperature_delta1': float(delta1),
-        'temperature_rm5': float(rm5),
-        'sin_hour': sin_hour,
-        'cos_hour': cos_hour
-    }
-
-# Step the input window forward by appending predicted row and dropping oldest
-def step_window_with_prediction(window_df, predicted_temp, step_minutes=SAMPLE_INTERVAL_MIN):
-    # window_df must contain timestamp column (pandas Timestamp) and feature columns
-    last_ts = pd.to_datetime(window_df['timestamp'].iloc[-1])
-    new_ts = last_ts + pd.Timedelta(minutes=step_minutes)
-    next_row = make_next_row_from_prediction(window_df, new_ts, predicted_temp)
-    # create new window
-    new_win = window_df.append(next_row, ignore_index=True)
-    new_win = new_win.tail(len(window_df)).reset_index(drop=True)
-    return new_win
-
 # The main API endpoint
-@app.route('/api/predict_temperature', methods=['GET'])
+@app.route("/api/predict/co", methods=["GET"])
+def predict_co():
+    return predict_co_api(history_collection)
+
+@app.route("/api/predict/mq2", methods=["GET"])
+def predict_mq2():
+    return predict_mq2_api(history_collection)
+
+@app.route("/api/predict/voc", methods=["GET"])
+def predict_voc():
+    return predict_voc_api(history_collection)
+
+@app.route("/api/predict/h2s", methods=["GET"])
+def predict_h2s():
+    return predict_h2s_api(history_collection)
+
+@app.route("/api/predict/humidity", methods=["GET"])
+def predict_humidity():
+    return predict_humidity_api(history_collection)
+
+@app.route("/api/predict/temperature", methods=["GET"])
 def predict_temperature():
-    """
-    GET params:
-      minutes (optional) - number of minutes ahead to predict (default 60)
-      source (optional) - 'mongo' or 'csv' : where to fetch raw sensor data (default: try mongo then csv)
-    Response: JSON with predicted value and metadata.
-    """
-    try:
-        minutes = int(request.args.get('minutes', '60'))
-        if minutes <= 0:
-            return jsonify({'status':'error','message':'minutes must be > 0'}), 400
+    return predict_temperature_api(history_collection)
 
-        # load raw data: prefer history_collection (Mongo) if available
-        df_raw = None
-        try:
-            # expects history_collection defined in your app (you had it earlier)
-            if 'history_collection' in globals():
-                # fetch last few hundred rows to be safe, sort ascending by timestamp
-                cursor = history_collection.find({}, {'_id':0, 'timestamp':1, 'temperature':1}).sort('timestamp', -1).limit(1000)
-                rows = list(cursor)
-                if rows:
-                    df_raw = pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
-        except Exception:
-            # if any mongo error, fallback to CSV
-            logger.exception("⚠ Mongo fetch failed in predict_temperature; will try CSV fallback")
 
-        # fallback to CSV (if you store temp.csv)
-        if df_raw is None or df_raw.empty:
-            csv_path = request.args.get('csv_path', 'temp.csv')
-            try:
-                df_raw = pd.read_csv(csv_path, parse_dates=[TIMESTAMP_COL])
-            except Exception:
-                return jsonify({'status':'error','message':'No data available (Mongo empty and CSV not found). Provide data in history_collection or temp.csv'}), 400
-
-        # Preprocess raw sensor data - this resamples & interpolates to fixed grid
-        dfp = preprocess_raw_temperature_df(df_raw)
-
-        # Ensure we have at least LOOKBACK points after resample
-        if len(dfp) < LOOKBACK:
-            return jsonify({'status':'error', 'message': f'Not enough data after resample: have {len(dfp)}, need {LOOKBACK}'}), 400
-
-        # Build initial window (last LOOKBACK rows)
-        window_df = dfp[['timestamp', 'temperature', 'temperature_delta1', 'temperature_rm5', 'sin_hour', 'cos_hour']].tail(LOOKBACK).reset_index(drop=True)
-
-        # load model & scalers
-        model, input_scaler, target_scaler = _load_artifacts()
-
-        # desired steps ahead
-        steps_needed = math.ceil(minutes / SAMPLE_INTERVAL_MIN)  # number of sample-steps ahead to reach requested minutes
-        # Use iterative forecasting in chunks of MODEL_HORIZON steps
-        preds = []   # predicted values at each model horizon step (real units)
-        total_steps = 0
-
-        # We'll loop until we've advanced >= steps_needed
-        while total_steps < steps_needed:
-            # Prepare X: last LOOKBACK rows of FEATURE_COLS as model input
-            X_np = window_df[FEATURE_COLS].values  # shape (LOOKBACK, n_feats)
-            # scale
-            n_feats = X_np.shape[1]
-            X_scaled = input_scaler.transform(X_np.reshape(-1, n_feats)).reshape(1, LOOKBACK, n_feats)
-            # predict (model produces 1 value - corresponding to MODEL_HORIZON steps ahead)
-            scaled_out = model.predict(X_scaled, verbose=0)
-            # inverse transform
-            try:
-                pred_real = float(target_scaler.inverse_transform(scaled_out.reshape(-1,1)).reshape(-1)[0])
-            except Exception:
-                # fallback if target_scaler expects different shape
-                pred_real = float(scaled_out.reshape(-1)[0])
-
-            # append predicted
-            preds.append({
-                'step_index': total_steps + MODEL_HORIZON,
-                'predicted_temp': pred_real
-            })
-
-            # advance window by MODEL_HORIZON steps: we'll append predicted rows MODEL_HORIZON times
-            # For simplicity, we append one predicted row at timestamp = last + MODEL_HORIZON*SAMPLE_INTERVAL_MIN,
-            # but better fidelity: append as many single-step rows as MODEL_HORIZON by repeatedly stepping.
-            # We'll step one interval at a time using predicted value as the next temp (approximation).
-            steps_to_advance = min(MODEL_HORIZON, steps_needed - total_steps)
-            for s in range(steps_to_advance):
-                # use current predicted value to step one interval forward
-                window_df = step_window_with_prediction(window_df, pred_real, step_minutes=SAMPLE_INTERVAL_MIN)
-                total_steps += 1
-                if total_steps >= steps_needed:
-                    break
-
-        # final predicted value is last preds[-1]['predicted_temp']; we can also produce a time for it
-        final_pred = preds[-1]['predicted_temp'] if preds else None
-        # compute predicted timestamp
-        last_ts = pd.to_datetime(window_df['timestamp'].iloc[-1])
-        predicted_ts = (last_ts).strftime('%Y-%m-%d %H:%M:%S')
-
-        return jsonify({
-            'status': 'success',
-            'requested_minutes': minutes,
-            'sample_interval_minutes': SAMPLE_INTERVAL_MIN,
-            'model_horizon_steps': MODEL_HORIZON,
-            'steps_needed': steps_needed,
-            'predicted_timestamp': predicted_ts,
-            'predicted_value': float(final_pred) if final_pred is not None else None,
-            'predictions_history': preds  # useful debugging info
-        }), 200
-
-    except Exception as e:
-        logger.exception("❌ predict_temperature endpoint failed")
-        return jsonify({'status':'error', 'message': str(e)}), 500
-
-# -----------------------------
 # FCM NOTIFICATION FUNCTION
 # -----------------------------
 def send_fcm_notification(title, body, level):
