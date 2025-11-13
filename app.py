@@ -1,5 +1,5 @@
 """
-Flask IoT backend (fixed daily averages calculation, CSV export removed)
+Flask IoT backend with Scheduled Notifications and Daily Routines
 
 Expect POST /api/sensordata JSON:
 {
@@ -17,19 +17,31 @@ MONGO_URI="your_mongo_uri"
 FIREBASE_SERVICE_ACCOUNT="path/to/serviceAccountKey.json"
 FCM_DEVICE_TOKEN="your_fcm_device_token"
 OPENWEATHER_API_KEY="your_openweather_api_key"
+GEMINI_API_KEY="your_gemini_api_key"
+TIMEZONE="Asia/Kolkata"
 """
+import json
+import traceback
 
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 import threading
 import time
 import os
 import requests
 import logging
+from tensorflow.keras.models import load_model
+import numpy as np
+import pandas as pd 
+from google import genai
 from pymongo import MongoClient, ASCENDING
 from dotenv import load_dotenv
 
-# Optional: firebase import guarded because sometimes environments don't have the SDK
+# APScheduler for scheduled notifications
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+
+# Optional: firebase import guarded
 firebase_available = False
 try:
     import firebase_admin
@@ -47,9 +59,11 @@ MONGO_URI = os.getenv('MONGO_URI')
 FIREBASE_SERVICE_ACCOUNT = os.getenv('FIREBASE_SERVICE_ACCOUNT', 'serviceAccountKey.json')
 FCM_DEVICE_TOKEN = os.getenv('FCM_DEVICE_TOKEN', '')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY', '')
-
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+
+# Timezone for scheduled notifications
+TIMEZONE = pytz.timezone(os.getenv('TIMEZONE', 'Asia/Kolkata'))
 
 # Monitor thread cooldown (sec)
 NOTIFY_COOLDOWN_SECONDS = int(os.getenv('NOTIFY_COOLDOWN_SECONDS', '60'))
@@ -57,14 +71,116 @@ MONITOR_LOOP_INTERVAL = float(os.getenv('MONITOR_LOOP_INTERVAL', '5'))
 
 # -----------------------------
 # ALERT THRESHOLDS (ppm / percent)
-# Tweak these values to match calibration/requirements.
 # -----------------------------
 THRESHOLDS = {
-    'mq2': { 'moderate': 50.0,  'extreme': 200.0 },   # LPG/Smoke ppm
-    'voc': { 'moderate': 300.0, 'extreme': 1000.0 },  # VOC ppm
-    'h2s': { 'moderate': 0.5,   'extreme': 1.5 },     # H2S ppm (very low thresholds)
-    'co':  { 'moderate': 35.0,  'extreme': 100.0 },   # CO ppm (WHO short-term ~35 ppm concern)
-    'air_quality_percent': { 'bad_threshold': 60.0 }  # percent threshold for "bad"
+    'mq2': { 'moderate': 50.0,  'extreme': 200.0 },
+    'voc': { 'moderate': 300.0, 'extreme': 1000.0 },
+    'h2s': { 'moderate': 0.5,   'extreme': 1.5 },
+    'co':  { 'moderate': 35.0,  'extreme': 100.0 },
+    'air_quality_percent': { 'bad_threshold': 60.0 }
+}
+
+# -----------------------------
+# DAILY ROUTINE CONFIGURATIONS
+# -----------------------------
+DAILY_ROUTINES = {
+    'morning_fresh_air': {
+        'time': (6, 0),
+        'title': '🌅 Morning Fresh-Air Routine',
+        'message': 'Open windows for 15-20 minutes. Let fresh outdoor air circulate before cooking begins.',
+        'tips': [
+            'Sunlight kills airborne microbes and reduces VOC buildup',
+            'Ideal temperature: 22-26°C, humidity 40-60%',
+            'If outdoor AQI < 100, open doors/windows fully'
+        ],
+        'level': 'Good'
+    },
+    'cooking_safety': {
+        'time': (8, 0),
+        'title': '🍳 Cooking Safety Check',
+        'message': 'Ensure kitchen ventilation and exhaust fan are ON during cooking.',
+        'tips': [
+            'Cooking increases LPG, CO₂, and VOCs',
+            'Use chimney or open balcony door',
+            'Avoid staying close to stove if readings rise'
+        ],
+        'level': 'Good'
+    },
+    'midday_refresh': {
+        'time': (11, 0),
+        'title': '☀️ Midday Air Refresh',
+        'message': 'Short ventilation break (5-10 minutes). Open windows briefly.',
+        'tips': [
+            'CO₂ can build up indoors even after morning airing',
+            'Run air purifier on Auto mode',
+            'Keep humidity between 40-65%'
+        ],
+        'level': 'Good'
+    },
+    'humidity_check': {
+        'time': (16, 0),
+        'title': '🌇 Humidity & Dust Check',
+        'message': 'Inspect humidity and dust levels in your home.',
+        'tips': [
+            'High humidity encourages mold growth',
+            'If humidity > 70%, use dehumidifier',
+            'Wipe surfaces and clear corners'
+        ],
+        'level': 'Good'
+    },
+    'evening_boost': {
+        'time': (19, 0),
+        'title': '🌆 Indoor Clean-Air Boost',
+        'message': 'Run ventilation or air purifier for 20 minutes.',
+        'tips': [
+            'Indoor VOCs rise after traffic hours',
+            'Avoid incense or strong fresheners',
+            'Use natural candles (soy, beeswax) for fragrance'
+        ],
+        'level': 'Good'
+    },
+    'night_comfort': {
+        'time': (21, 30),
+        'title': '🌙 Night Comfort Check',
+        'message': 'Before bed, ensure sensors read safe levels.',
+        'tips': [
+            'Ideal sleep: CO₂ < 800 ppm, Temp ~25°C',
+            'Slightly open window if CO₂ is high',
+            'Unplug chargers to reduce ozone/VOC drift'
+        ],
+        'level': 'Good'
+    }
+}
+
+WEEKLY_ROUTINES = {
+    'monday': {
+        'day': 0,
+        'time': (9, 0),
+        'title': '🧹 Monday Maintenance',
+        'message': 'Wipe ceiling fans and A/C filters.',
+        'tips': ['Clean filters improve air circulation', 'Reduces dust and allergens']
+    },
+    'wednesday': {
+        'day': 2,
+        'time': (10, 0),
+        'title': '🪴 Wednesday Plant Check',
+        'message': 'Check indoor plants\' soil - avoid over-watering.',
+        'tips': ['Over-watering increases VOC/mold risk', 'Ensure proper drainage']
+    },
+    'friday': {
+        'day': 4,
+        'time': (10, 0),
+        'title': '🧼 Friday Deep Clean',
+        'message': 'Deep-clean kitchen and bathroom vents.',
+        'tips': ['Prevents grease and dust buildup', 'Improves ventilation efficiency']
+    },
+    'sunday': {
+        'day': 6,
+        'time': (10, 0),
+        'title': '☀️ Sunday Airing Day',
+        'message': 'Balcony/window airing for 30 min. Sun-dry bedsheets or cushions.',
+        'tips': ['UV rays kill bacteria and dust mites', 'Fresh air removes indoor odors']
+    }
 }
 
 # -----------------------------
@@ -84,17 +200,15 @@ except Exception:
     pass
 
 # -----------------------------
-# MONGODB CONNECTION (ATLAS)
+# MONGODB CONNECTION
 # -----------------------------
 try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command('ping')  # verify connection
-    db = client.get_database()
-    # Collections
-    sensor_collection = db['sensor_snapshot']    # latest single doc (_id=1)
-    avg_collection = db['daily_average_ppm']     # rolling 3-day averages (ppm)
-    history_collection = db['sensor_history_ppm']# time-series history
-    # Indices
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.admin.command('ping')
+    db = mongo_client.get_database()
+    sensor_collection = db['sensor_snapshot']
+    avg_collection = db['daily_average_ppm']
+    history_collection = db['sensor_history_ppm']
     history_collection.create_index([('timestamp', ASCENDING)])
     avg_collection.create_index([('date', ASCENDING)])
     sensor_collection.create_index([('_id', ASCENDING)])
@@ -104,7 +218,7 @@ except Exception as e:
     raise
 
 # -----------------------------
-# FIREBASE INITIALIZATION (optional)
+# FIREBASE INITIALIZATION
 # -----------------------------
 firebase_initialized = False
 if firebase_available:
@@ -120,7 +234,25 @@ if firebase_available:
         logger.exception('❌ Firebase initialization failed; continuing without FCM')
         firebase_initialized = False
 else:
-    logger.warning('⚠ firebase-admin not installed or import failed; notifications disabled')
+    logger.warning('⚠ firebase-admin not installed; notifications disabled')
+
+# -----------------------------
+# GEMINI INITIALIZATION
+# -----------------------------
+gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("✅ Gemini client initialized successfully")
+    except Exception:
+        logger.exception("❌ Failed to initialize Gemini client")
+else:
+    logger.warning("⚠ GEMINI_API_KEY not found; Gemini suggestions disabled")
+
+# -----------------------------
+# APSCHEDULER INITIALIZATION
+# -----------------------------
+scheduler = BackgroundScheduler(timezone=TIMEZONE)
 
 # -----------------------------
 # GLOBALS
@@ -140,9 +272,6 @@ def safe_float(v, default=0.0):
         return default
 
 def _ensure_tz_aware(dt):
-    """
-    Ensure a datetime is timezone-aware. If naive, assume UTC and set tzinfo=timezone.utc.
-    """
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -150,144 +279,220 @@ def _ensure_tz_aware(dt):
     return dt
 
 def _date_range_from_iso(date_iso):
-    """
-    Given a date string 'YYYY-MM-DD', return (start_dt, end_dt) timezone-aware in UTC
-    representing [date 00:00:00, next_date 00:00:00)
-    """
     d = datetime.strptime(date_iso, '%Y-%m-%d').date()
     start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     return start, end
 
-# -----------------------------
-# FIREBASE NOTIFICATION FUNCTION
-# -----------------------------
-# -----------------------------
-# Gemini (Google Generative) helper
-# -----------------------------
-def call_gemini_for_suggestions(three_day_averages, model=GEMINI_MODEL, api_key=GEMINI_API_KEY, timeout=10):
-    """
-    three_day_averages: list of dicts like returned by /api/viewdailyaverage
-    Returns: dict with raw Gemini JSON (or error)
-    """
-    if not api_key:
-        return {'error': 'GEMINI_API_KEY not configured'}
+MODEL_PATH = os.path.join("temp_model", "temp_final.keras")   # path to your .keras model
+INPUT_SCALER_PATH = os.path.join("temp_model", "input_scaler.joblib")
+TARGET_SCALER_PATH = os.path.join("temp_model", "target_scaler.joblib")
 
-    # Build a compact prompt: include JSON and ask for suggestions
-    prompt_lines = []
-    prompt_lines.append("You are an assistant that analyzes 3-day indoor air quality summaries and gives:\n"
-                        "- short plain-language summary for each day\n"
-                        "- overall trend (improving/worsening/stable)\n"
-                        "- top 3 recommendations for the user (safety and actions)\n"
-                        "- any sensors/values of concern and why\n")
-    prompt_lines.append("Here are the 3-day daily averages (date, counts, and average ppm/%):")
-    # attach data as a JSON block for clarity
-    prompt_lines.append(json.dumps(three_day_averages, indent=2))
-    prompt_lines.append("\nRespond with a short JSON object containing: summary_by_day (array of {date, summary}), overall_trend, recommendations (array), concerns (array). Also include a short human-readable 'text' field summarizing findings.")
-    prompt_text = "\n\n".join(prompt_lines)
+SAMPLE_INTERVAL_MIN = 2   # same as training
+LOOKBACK = 60             # same as training
+MODEL_HORIZON = 15        # the horizon (in steps) the model was trained for (e.g., 15 -> 30 minutes)
+FEATURE_COLS = ['temperature', 'temperature_delta1', 'temperature_rm5', 'sin_hour', 'cos_hour']
+TIMESTAMP_COL = 'timestamp'
+TARGET = 'temperature'
 
-    # Build request body in Gemini generateContent format (simple text contents)
-    body = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt_text}
-                ],
-                # role may be omitted or set; docs accept simple content blocks
-            }
-        ],
-        # You can tune model params here if desired
-        "temperature": 0.2,
-        "maxOutputTokens": 512
+# Load model and scalers once
+_pred_model = None
+_input_scaler = None
+_target_scaler = None
+#MODEL CODES
+def _load_artifacts():
+    global _pred_model, _input_scaler, _target_scaler
+    if _pred_model is None:
+        _pred_model = load_model(MODEL_PATH)
+    if _input_scaler is None:
+        _input_scaler = joblib.load(INPUT_SCALER_PATH)
+    if _target_scaler is None:
+        _target_scaler = joblib.load(TARGET_SCALER_PATH)
+    return _pred_model, _input_scaler, _target_scaler
+
+# Preprocess raw timestamp+temperature -> resampled df with engineered features
+def preprocess_raw_temperature_df(df_raw):
+    df = df_raw.copy()
+    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL])
+    df = df.sort_values(TIMESTAMP_COL).reset_index(drop=True)
+
+    # set index and resample to fixed interval, interpolate missing
+    df = df.set_index(TIMESTAMP_COL).resample(f"{SAMPLE_INTERVAL_MIN}T").mean().interpolate('time')
+
+    # smoothing median filter (as training)
+    df[TARGET] = df[TARGET].rolling(3, center=True, min_periods=1).median()
+
+    # features
+    df[f'{TARGET}_delta1'] = df[TARGET].diff().fillna(0)
+    df[f'{TARGET}_rm5'] = df[TARGET].rolling(5, min_periods=1).mean()
+
+    # cyclical time
+    dt_index = df.index.to_series()
+    hour = dt_index.dt.hour + dt_index.dt.minute / 60.0
+    df['sin_hour'] = np.sin(2 * np.pi * hour / 24.0)
+    df['cos_hour'] = np.cos(2 * np.pi * hour / 24.0)
+
+    df = df.reset_index()
+    return df
+
+# Helper: create next-step features row given last window and predicted temperature
+def make_next_row_from_prediction(last_window_df, new_timestamp, predicted_temp):
+    """
+    last_window_df: pandas DataFrame of the last LOOKBACK rows (in original feature/column layout)
+    new_timestamp: pd.Timestamp for the synthetic next row
+    predicted_temp: float, predicted temperature (real units)
+    Returns: dict of features matching FEATURE_COLS for appended row
+    """
+    # last real temperatures for rolling computations
+    temps = list(last_window_df['temperature'].values)
+    # compute delta
+    last_temp = temps[-1]
+    delta1 = predicted_temp - last_temp
+    # compute rm5 using up to last 4 values + predicted
+    last_for_rm = temps[-4:] if len(temps) >= 4 else temps
+    rm5_vals = last_for_rm + [predicted_temp]
+    rm5 = float(np.mean(rm5_vals))
+
+    # cyclical time
+    hour = new_timestamp.hour + new_timestamp.minute / 60.0
+    sin_hour = float(np.sin(2 * np.pi * hour / 24.0))
+    cos_hour = float(np.cos(2 * np.pi * hour / 24.0))
+
+    return {
+        'timestamp': new_timestamp,
+        'temperature': float(predicted_temp),
+        'temperature_delta1': float(delta1),
+        'temperature_rm5': float(rm5),
+        'sin_hour': sin_hour,
+        'cos_hour': cos_hour
     }
 
-    # Use the documented generateContent REST endpoint (v1beta or v1 depending on your access)
-    # Example base: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# Step the input window forward by appending predicted row and dropping oldest
+def step_window_with_prediction(window_df, predicted_temp, step_minutes=SAMPLE_INTERVAL_MIN):
+    # window_df must contain timestamp column (pandas Timestamp) and feature columns
+    last_ts = pd.to_datetime(window_df['timestamp'].iloc[-1])
+    new_ts = last_ts + pd.Timedelta(minutes=step_minutes)
+    next_row = make_next_row_from_prediction(window_df, new_ts, predicted_temp)
+    # create new window
+    new_win = window_df.append(next_row, ignore_index=True)
+    new_win = new_win.tail(len(window_df)).reset_index(drop=True)
+    return new_win
 
-    headers = {
-        "Content-Type": "application/json",
-        # Many examples pass the key as query param ?key=API_KEY or via x-goog-api-key header.
-        # We'll send it as an x-goog-api-key header (works with API key auth).
-        "x-goog-api-key": api_key
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=body, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        logger.exception("❌ call_gemini_for_suggestions failed")
-        return {"error": str(e), "status_code": getattr(e.response, "status_code", None),
-                "text": getattr(e.response, "text", None)}
-
-# -----------------------------
-# API: Ask Gemini for suggestions based on last 3 days
-# -----------------------------
-@app.route('/api/gemini_suggestions', methods=['GET'])
-def gemini_suggestions():
+# The main API endpoint
+@app.route('/api/predict_temperature', methods=['GET'])
+def predict_temperature():
     """
-    Returns suggestions from Gemini for the last 3 daily averages.
-    Query params:
-      model (optional) - override default model
+    GET params:
+      minutes (optional) - number of minutes ahead to predict (default 60)
+      source (optional) - 'mongo' or 'csv' : where to fetch raw sensor data (default: try mongo then csv)
+    Response: JSON with predicted value and metadata.
     """
     try:
-        model = request.args.get('model', GEMINI_MODEL)
+        minutes = int(request.args.get('minutes', '60'))
+        if minutes <= 0:
+            return jsonify({'status':'error','message':'minutes must be > 0'}), 400
 
-        # Fetch last 3 day averages same as /api/viewdailyaverage logic
-        rows_cursor = avg_collection.find({}, {'_id': 0}).sort('date', -1).limit(3)
-        rows = list(rows_cursor)
-        if not rows:
-            return jsonify({'status': 'error', 'message': 'no daily averages available'}), 404
-
-        # We will send the rows directly — keep keys consistent with view_daily_average output
-        # Ensure ordering oldest -> newest might be easier for human reading; reverse if currently desc
-        three_days = list(reversed(rows))  # oldest first
-
-        # Call Gemini
-        model_name = model or GEMINI_MODEL
-        gemini_resp = call_gemini_for_suggestions(three_days, model=model_name)
-
-        # Try to extract a readable text from recommended fields (response shape may differ by model version)
-        # The Gemini REST response commonly includes a top-level 'candidates' or 'outputs' structure.
-        # We'll attempt a safe extraction:
-        human_text = None
+        # load raw data: prefer history_collection (Mongo) if available
+        df_raw = None
         try:
-            # some docs show top-level 'candidates' with 'content' or 'output' fields
-            if isinstance(gemini_resp, dict):
-                # new style: 'candidates' or 'output' or 'outputs'
-                if 'candidates' in gemini_resp and len(gemini_resp['candidates']) > 0:
-                    # candidate might contain 'content' with 'text' or 'output'
-                    cand = gemini_resp['candidates'][0]
-                    # attempt to find text fields
-                    human_text = cand.get('content', {}).get('text') if isinstance(cand.get('content'), dict) else cand.get('content')
-                    if not human_text:
-                        human_text = cand.get('output') or cand.get('text')
-                elif 'outputs' in gemini_resp and len(gemini_resp['outputs']) > 0:
-                    # outputs often have 'content' -> list -> {'type':'output_text','text': '...'}
-                    out = gemini_resp['outputs'][0]
-                    if isinstance(out.get('content'), list):
-                        for c in out['content']:
-                            if c.get('type') in ('output_text','text'):
-                                human_text = c.get('text')
-                                break
-                elif 'text' in gemini_resp:
-                    human_text = gemini_resp.get('text')
+            # expects history_collection defined in your app (you had it earlier)
+            if 'history_collection' in globals():
+                # fetch last few hundred rows to be safe, sort ascending by timestamp
+                cursor = history_collection.find({}, {'_id':0, 'timestamp':1, 'temperature':1}).sort('timestamp', -1).limit(1000)
+                rows = list(cursor)
+                if rows:
+                    df_raw = pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
         except Exception:
-            human_text = None
+            # if any mongo error, fallback to CSV
+            logger.exception("⚠ Mongo fetch failed in predict_temperature; will try CSV fallback")
+
+        # fallback to CSV (if you store temp.csv)
+        if df_raw is None or df_raw.empty:
+            csv_path = request.args.get('csv_path', 'temp.csv')
+            try:
+                df_raw = pd.read_csv(csv_path, parse_dates=[TIMESTAMP_COL])
+            except Exception:
+                return jsonify({'status':'error','message':'No data available (Mongo empty and CSV not found). Provide data in history_collection or temp.csv'}), 400
+
+        # Preprocess raw sensor data - this resamples & interpolates to fixed grid
+        dfp = preprocess_raw_temperature_df(df_raw)
+
+        # Ensure we have at least LOOKBACK points after resample
+        if len(dfp) < LOOKBACK:
+            return jsonify({'status':'error', 'message': f'Not enough data after resample: have {len(dfp)}, need {LOOKBACK}'}), 400
+
+        # Build initial window (last LOOKBACK rows)
+        window_df = dfp[['timestamp', 'temperature', 'temperature_delta1', 'temperature_rm5', 'sin_hour', 'cos_hour']].tail(LOOKBACK).reset_index(drop=True)
+
+        # load model & scalers
+        model, input_scaler, target_scaler = _load_artifacts()
+
+        # desired steps ahead
+        steps_needed = math.ceil(minutes / SAMPLE_INTERVAL_MIN)  # number of sample-steps ahead to reach requested minutes
+        # Use iterative forecasting in chunks of MODEL_HORIZON steps
+        preds = []   # predicted values at each model horizon step (real units)
+        total_steps = 0
+
+        # We'll loop until we've advanced >= steps_needed
+        while total_steps < steps_needed:
+            # Prepare X: last LOOKBACK rows of FEATURE_COLS as model input
+            X_np = window_df[FEATURE_COLS].values  # shape (LOOKBACK, n_feats)
+            # scale
+            n_feats = X_np.shape[1]
+            X_scaled = input_scaler.transform(X_np.reshape(-1, n_feats)).reshape(1, LOOKBACK, n_feats)
+            # predict (model produces 1 value - corresponding to MODEL_HORIZON steps ahead)
+            scaled_out = model.predict(X_scaled, verbose=0)
+            # inverse transform
+            try:
+                pred_real = float(target_scaler.inverse_transform(scaled_out.reshape(-1,1)).reshape(-1)[0])
+            except Exception:
+                # fallback if target_scaler expects different shape
+                pred_real = float(scaled_out.reshape(-1)[0])
+
+            # append predicted
+            preds.append({
+                'step_index': total_steps + MODEL_HORIZON,
+                'predicted_temp': pred_real
+            })
+
+            # advance window by MODEL_HORIZON steps: we'll append predicted rows MODEL_HORIZON times
+            # For simplicity, we append one predicted row at timestamp = last + MODEL_HORIZON*SAMPLE_INTERVAL_MIN,
+            # but better fidelity: append as many single-step rows as MODEL_HORIZON by repeatedly stepping.
+            # We'll step one interval at a time using predicted value as the next temp (approximation).
+            steps_to_advance = min(MODEL_HORIZON, steps_needed - total_steps)
+            for s in range(steps_to_advance):
+                # use current predicted value to step one interval forward
+                window_df = step_window_with_prediction(window_df, pred_real, step_minutes=SAMPLE_INTERVAL_MIN)
+                total_steps += 1
+                if total_steps >= steps_needed:
+                    break
+
+        # final predicted value is last preds[-1]['predicted_temp']; we can also produce a time for it
+        final_pred = preds[-1]['predicted_temp'] if preds else None
+        # compute predicted timestamp
+        last_ts = pd.to_datetime(window_df['timestamp'].iloc[-1])
+        predicted_ts = (last_ts).strftime('%Y-%m-%d %H:%M:%S')
 
         return jsonify({
             'status': 'success',
-            'model_response': gemini_resp,
-            'human_readable': human_text
+            'requested_minutes': minutes,
+            'sample_interval_minutes': SAMPLE_INTERVAL_MIN,
+            'model_horizon_steps': MODEL_HORIZON,
+            'steps_needed': steps_needed,
+            'predicted_timestamp': predicted_ts,
+            'predicted_value': float(final_pred) if final_pred is not None else None,
+            'predictions_history': preds  # useful debugging info
         }), 200
 
-    except Exception:
-        logger.exception('❌ gemini_suggestions endpoint failed')
-        return jsonify({'status': 'error', 'message': 'internal error'}), 500
+    except Exception as e:
+        logger.exception("❌ predict_temperature endpoint failed")
+        return jsonify({'status':'error', 'message': str(e)}), 500
 
-
+# -----------------------------
+# FCM NOTIFICATION FUNCTION
+# -----------------------------
 def send_fcm_notification(title, body, level):
+    """Send FCM notification to the configured device token"""
     if not firebase_initialized or not FCM_DEVICE_TOKEN:
         logger.info('ℹ Skipping FCM send (firebase not initialized or token missing)')
         return
@@ -299,7 +504,7 @@ def send_fcm_notification(title, body, level):
                 priority='high',
                 notification=messaging.AndroidNotification(
                     sound='default',
-                    color='#FF0000' if level == 'Extreme' else '#FFA500'
+                    color='#FF0000' if level == 'Extreme' else '#FFA500' if level == 'Moderate' else '#4CAF50'
                 )
             ),
             data={'click_action': 'FLUTTER_NOTIFICATION_CLICK', 'alert_level': level}
@@ -310,15 +515,145 @@ def send_fcm_notification(title, body, level):
         logger.exception('❌ Failed to send FCM Notification')
 
 # -----------------------------
-# ALERT EVALUATION (ppm-aware)
+# ROUTINE NOTIFICATION FUNCTIONS
+# -----------------------------
+def send_routine_notification(routine_key, routine_data):
+    """Send notification for a routine reminder with sensor context"""
+    try:
+        title = routine_data['title']
+        message = routine_data['message']
+        level = routine_data.get('level', 'Good')
+        
+        # Add sensor context if available
+        row = sensor_collection.find_one({'_id': 1})
+        if row:
+            temp = safe_float(row.get('temperature', 0))
+            humidity = safe_float(row.get('humidity', 0))
+            co_ppm = safe_float(row.get('co_ppm', 0))
+            
+            # Add contextual info
+            context = f"\n\nCurrent: Temp {temp:.1f}°C, Humidity {humidity:.1f}%"
+            
+            # Special handling for specific routines
+            if routine_key == 'morning_fresh_air' and humidity > 70:
+                message += " ⚠️ High humidity detected - extra ventilation recommended!"
+            elif routine_key == 'night_comfort' and co_ppm > 80:
+                message += " ⚠️ CO levels elevated - open a window slightly!"
+            elif routine_key == 'humidity_check':
+                if humidity > 70:
+                    message += f" ⚠️ Current humidity {humidity:.1f}% - use dehumidifier!"
+                elif humidity < 40:
+                    message += f" ⚠️ Low humidity {humidity:.1f}% - consider humidifier!"
+                else:
+                    message += f" ✅ Humidity is good at {humidity:.1f}%"
+            
+            message += context
+        
+        # Send FCM notification
+        send_fcm_notification(title, message, level)
+        logger.info(f"✅ Sent routine reminder: {routine_key}")
+        
+    except Exception:
+        logger.exception(f"❌ Failed to send routine notification: {routine_key}")
+
+# Define routine functions
+def morning_fresh_air():
+    send_routine_notification('morning_fresh_air', DAILY_ROUTINES['morning_fresh_air'])
+
+def cooking_safety():
+    send_routine_notification('cooking_safety', DAILY_ROUTINES['cooking_safety'])
+
+def midday_refresh():
+    send_routine_notification('midday_refresh', DAILY_ROUTINES['midday_refresh'])
+
+def humidity_check():
+    send_routine_notification('humidity_check', DAILY_ROUTINES['humidity_check'])
+
+def evening_boost():
+    send_routine_notification('evening_boost', DAILY_ROUTINES['evening_boost'])
+
+def night_comfort():
+    send_routine_notification('night_comfort', DAILY_ROUTINES['night_comfort'])
+
+def monday_maintenance():
+    send_routine_notification('monday', WEEKLY_ROUTINES['monday'])
+
+def wednesday_plant_check():
+    send_routine_notification('wednesday', WEEKLY_ROUTINES['wednesday'])
+
+def friday_deep_clean():
+    send_routine_notification('friday', WEEKLY_ROUTINES['friday'])
+
+def sunday_airing():
+    send_routine_notification('sunday', WEEKLY_ROUTINES['sunday'])
+
+# -----------------------------
+# SCHEDULE ROUTINES
+# -----------------------------
+def schedule_daily_routines():
+    """Schedule all daily air quality routines"""
+    try:
+        # Daily routines
+        func_map = {
+            'morning_fresh_air': morning_fresh_air,
+            'cooking_safety': cooking_safety,
+            'midday_refresh': midday_refresh,
+            'humidity_check': humidity_check,
+            'evening_boost': evening_boost,
+            'night_comfort': night_comfort
+        }
+        
+        for routine_key, routine_data in DAILY_ROUTINES.items():
+            hour, minute = routine_data['time']
+            scheduler.add_job(
+                func_map[routine_key],
+                trigger='cron',
+                hour=hour,
+                minute=minute,
+                timezone=TIMEZONE,
+                id=f'routine_{routine_key}'
+            )
+            logger.info(f"✅ Scheduled {routine_key} at {hour:02d}:{minute:02d}")
+        
+        # Weekly routines
+        scheduler.add_job(monday_maintenance, trigger='cron', day_of_week='mon', hour=9, minute=0, timezone=TIMEZONE, id='routine_monday')
+        scheduler.add_job(wednesday_plant_check, trigger='cron', day_of_week='wed', hour=10, minute=0, timezone=TIMEZONE, id='routine_wednesday')
+        scheduler.add_job(friday_deep_clean, trigger='cron', day_of_week='fri', hour=10, minute=0, timezone=TIMEZONE, id='routine_friday')
+        scheduler.add_job(sunday_airing, trigger='cron', day_of_week='sun', hour=10, minute=0, timezone=TIMEZONE, id='routine_sunday')
+        
+        logger.info("✅ All daily routines scheduled")
+    except Exception:
+        logger.exception("❌ Failed to schedule routines")
+
+# -----------------------------
+# GEMINI HELPER
+# -----------------------------
+def call_gemini_for_suggestions(three_day_averages, model=GEMINI_MODEL):
+    if not gemini_client:
+        return {"error": "Gemini client not initialized or missing API key"}
+    try:
+        prompt = (
+            "You are an assistant analyzing indoor air quality for the past 3 days. "
+            "Summarize the overall air quality trends, highlight any risks, "
+            "and provide 3 simple safety recommendations for the user.\n\n"
+            "Here are the 3 days of averaged sensor data:\n"
+            f"{json.dumps(three_day_averages, indent=2)}\n\n"
+            "Return a short and clear explanation."
+        )
+        response = gemini_client.models.generate_content(model=model, contents=prompt)
+        text_out = getattr(response, "text", None)
+        if not text_out and hasattr(response, "candidates"):
+            text_out = response.candidates[0].content.parts[0].text
+        return {"text": text_out or "No output text", "raw": str(response)}
+    except Exception as e:
+        logger.exception("❌ Gemini generation failed")
+        return {"error": str(e)}
+
+# -----------------------------
+# ALERT EVALUATION
 # -----------------------------
 def evaluate_alerts(doc):
-    """
-    doc is expected to contain:
-    mq2_ppm, temperature, humidity, voc_ppm, h2s_ppm, co_ppm, air_quality_percent
-    """
     alerts = {}
-
     mq2 = safe_float(doc.get('mq2_ppm', 0.0))
     temperature = safe_float(doc.get('temperature', 0.0))
     humidity = safe_float(doc.get('humidity', 0.0))
@@ -327,47 +662,39 @@ def evaluate_alerts(doc):
     co = safe_float(doc.get('co_ppm', 0.0))
     aq_percent = safe_float(doc.get('air_quality_percent', 100.0))
 
-    # MQ-2 (LPG/Smoke)
     if THRESHOLDS['mq2']['moderate'] < mq2 <= THRESHOLDS['mq2']['extreme']:
         alerts['mq2'] = ('Moderate', f'⚠ MODERATE: LPG/Smoke detected {mq2:.2f} ppm — ventilate.')
     elif mq2 > THRESHOLDS['mq2']['extreme']:
         alerts['mq2'] = ('Extreme', f'🚨 EXTREME: LPG/Smoke: {mq2:.2f} ppm — take immediate action!')
 
-    # CO (MQ-7)
     if THRESHOLDS['co']['moderate'] < co <= THRESHOLDS['co']['extreme']:
         alerts['co'] = ('Moderate', f'⚠ MODERATE: CO rising {co:.2f} ppm — ventilate.')
     elif co > THRESHOLDS['co']['extreme']:
         alerts['co'] = ('Extreme', f'🚨 EXTREME: High CO {co:.2f} ppm — danger!')
 
-    # H2S (MQ-136) - small ppm values are dangerous
     if THRESHOLDS['h2s']['moderate'] < h2s <= THRESHOLDS['h2s']['extreme']:
         alerts['h2s'] = ('Moderate', f'⚠ MODERATE: H2S detected {h2s:.3f} ppm.')
     elif h2s > THRESHOLDS['h2s']['extreme']:
         alerts['h2s'] = ('Extreme', f'🚨 EXTREME: High H2S {h2s:.3f} ppm — evacuate area!')
 
-    # VOC
     if THRESHOLDS['voc']['moderate'] < voc <= THRESHOLDS['voc']['extreme']:
         alerts['voc'] = ('Moderate', f'⚠ MODERATE: VOCs {voc:.2f} ppm — ventilate.')
     elif voc > THRESHOLDS['voc']['extreme']:
         alerts['voc'] = ('Extreme', f'🚨 EXTREME: VOC level critical {voc:.2f} ppm!')
 
-    # Temperature
     if 32.0 < temperature <= 35.0:
         alerts['temperature'] = ('Moderate', '🌡 MODERATE: Slightly high temperature.')
     elif temperature > 35.0:
         alerts['temperature'] = ('Extreme', '🔥 EXTREME: Temperature too high!')
 
-    # Humidity
     if (70.0 < humidity <= 80.0) or (20.0 < humidity <= 30.0):
         alerts['humidity'] = ('Moderate', '💧 MODERATE: Humidity slightly off.')
     elif humidity > 90.0 or humidity < 20.0:
         alerts['humidity'] = ('Extreme', '💧 EXTREME: Humidity critical!')
 
-    # Air Quality percent (user-facing)
     if aq_percent < THRESHOLDS['air_quality_percent']['bad_threshold']:
         alerts['air_quality_percent'] = ('Moderate', f'⚠ Air Quality degrading: {aq_percent:.1f}%')
 
-    # Resolve by priority
     for key in priority_order:
         if key in alerts:
             level, message = alerts[key]
@@ -389,105 +716,64 @@ def initialize_db():
                 'h2s_ppm': 0.0,
                 'co_ppm': 0.0,
                 'air_quality_percent': 100.0,
-                # store timezone-aware ISO timestamp (UTC)
                 'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %z')
             })
-            logger.info('✅ MongoDB ready with initial sensor document (ppm fields)')
+            logger.info('✅ MongoDB ready with initial sensor document')
     except Exception:
         logger.exception('❌ initialize_db failed')
 
 # -----------------------------
-# API: Receive Sensor Data
+# DAILY AVERAGE UPDATE
 # -----------------------------
-@app.route('/api/sensordata', methods=['POST'])
-def receive_data():
-    try:
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({'status': 'error', 'message': 'Invalid JSON'}), 400
-
-    logger.info('📩 Received data: %s', data)
-
-    # Parse and coerce numeric values safely
-    mq2_ppm = safe_float(data.get('mq2_ppm', data.get('gas_value', 0.0)))
+def update_daily_average(data):
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    mq2 = safe_float(data.get('mq2_ppm', 0.0))
     temperature = safe_float(data.get('temperature', 0.0))
     humidity = safe_float(data.get('humidity', 0.0))
-    voc_ppm = safe_float(data.get('voc_ppm', data.get('voc', 0.0)))
-    h2s_ppm = safe_float(data.get('h2s_ppm', data.get('h2s', 0.0)))
-    co_ppm = safe_float(data.get('co_ppm', data.get('co', 0.0)))
-    air_quality_percent = safe_float(data.get('air_quality_percent', data.get('voc_percent', 0.0)))
-    timestamp = datetime.now(timezone.utc)  # timezone-aware UTC
+    voc = safe_float(data.get('voc_ppm', 0.0))
+    h2s = safe_float(data.get('h2s_ppm', 0.0))
+    co = safe_float(data.get('co_ppm', 0.0))
+    aq = safe_float(data.get('air_quality_percent', 0.0))
 
-    # Update latest doc (atomic upsert)
     try:
-        sensor_collection.update_one(
-            {'_id': 1},
-            {'$set': {
-                'mq2_ppm': mq2_ppm,
-                'temperature': temperature,
-                'humidity': humidity,
-                'voc_ppm': voc_ppm,
-                'h2s_ppm': h2s_ppm,
-                'co_ppm': co_ppm,
-                'air_quality_percent': air_quality_percent,
-                # save a human-readable UTC timestamp with offset
-                'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S %z')
-            }},
+        avg_collection.update_one(
+            {'date': today},
+            {
+                '$inc': {
+                    'mq2_sum': mq2, 'temperature_sum': temperature, 'humidity_sum': humidity,
+                    'voc_sum': voc, 'h2s_sum': h2s, 'co_sum': co, 'air_quality_sum': aq, 'count': 1
+                },
+                '$setOnInsert': {'date': today}
+            },
             upsert=True
         )
-    except Exception:
-        logger.exception('❌ Failed to update latest sensor document')
-
-    # Insert into history (store tz-aware datetime)
-    try:
-        history_doc = {
-            'mq2_ppm': mq2_ppm,
-            'temperature': temperature,
-            'humidity': humidity,
-            'voc_ppm': voc_ppm,
-            'h2s_ppm': h2s_ppm,
-            'co_ppm': co_ppm,
-            'air_quality_percent': air_quality_percent,
-            'timestamp': timestamp  # tz-aware datetime
-        }
-        history_collection.insert_one(history_doc)
-    except Exception:
-        logger.exception('❌ Failed to insert history doc')
-
-    # Update daily averages
-    try:
-        update_daily_average({
-            'mq2_ppm': mq2_ppm,
-            'temperature': temperature,
-            'humidity': humidity,
-            'voc_ppm': voc_ppm,
-            'h2s_ppm': h2s_ppm,
-            'co_ppm': co_ppm,
-            'air_quality_percent': air_quality_percent
-        })
+        
+        doc = avg_collection.find_one({'date': today})
+        if doc and doc.get('count', 0) > 0:
+            count = doc['count']
+            avg_collection.update_one(
+                {'date': today},
+                {'$set': {
+                    'avg_mq2_ppm': round(doc.get('mq2_sum', 0.0) / count, 3),
+                    'avg_temperature': round(doc.get('temperature_sum', 0.0) / count, 2),
+                    'avg_humidity': round(doc.get('humidity_sum', 0.0) / count, 2),
+                    'avg_voc_ppm': round(doc.get('voc_sum', 0.0) / count, 3),
+                    'avg_h2s_ppm': round(doc.get('h2s_sum', 0.0) / count, 4),
+                    'avg_co_ppm': round(doc.get('co_sum', 0.0) / count, 3),
+                    'avg_air_quality_percent': round(doc.get('air_quality_sum', 0.0) / count, 2)
+                }}
+            )
     except Exception:
         logger.exception('❌ update_daily_average failed')
 
-    return jsonify({'status': 'success', 'message': 'Data updated successfully'}), 200
-
-# -----------------------------
-# API: Get Latest Sensor Data
-# -----------------------------
-@app.route('/api/viewdata', methods=['GET'])
-def view_data():
+    # Cleanup
     try:
-        row = sensor_collection.find_one({'_id': 1}, {'_id': 0})
-        return jsonify(row if row else {}), 200
+        all_docs = list(avg_collection.find().sort('date', -1))
+        if len(all_docs) > 3:
+            for doc in all_docs[3:]:
+                avg_collection.delete_one({'_id': doc['_id']})
     except Exception:
-        logger.exception('❌ view_data failed')
-        return jsonify({}), 500
-
-# -----------------------------
-# API: Get Latest Alert
-# -----------------------------
-@app.route('/api/alertstatus', methods=['GET'])
-def get_alert():
-    return jsonify(latest_alert), 200
+        logger.exception('⚠ Failed to cleanup old averages')
 
 # -----------------------------
 # BACKGROUND MONITOR LOOP
@@ -495,9 +781,7 @@ def get_alert():
 def monitor_loop(notify_cooldown_seconds=NOTIFY_COOLDOWN_SECONDS, interval=MONITOR_LOOP_INTERVAL):
     global latest_alert
     last_sent_message = None
-    # timezone-aware minimum time
     last_sent_time = datetime.min.replace(tzinfo=timezone.utc)
-
     logger.info('🔁 monitor_loop started (interval=%ss)', interval)
 
     while True:
@@ -529,109 +813,99 @@ def monitor_loop(notify_cooldown_seconds=NOTIFY_COOLDOWN_SECONDS, interval=MONIT
 
         time.sleep(interval)
 
-# -----------------------------
-# WEATHER API
-# -----------------------------
-@app.route('/get-data-weather', methods=['GET'])
-def get_weather():
-    lat = request.args.get('lat', '16.4821')
-    lon = request.args.get('lon', '80.6914')
-    api_key = OPENWEATHER_API_KEY
-    if not api_key:
-        return jsonify({'error': 'OpenWeather API key not configured'}), 400
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
 
-    url = 'http://api.openweathermap.org/data/2.5/air_pollution'
-    params = {'lat': lat, 'lon': lon, 'appid': api_key}
+@app.route('/api/sensordata', methods=['POST'])
+def receive_data():
     try:
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        print('🌤 Weather API response:', response.json())
-        return jsonify(response.json()), 200
+        data = request.get_json(force=True)
     except Exception:
-        logger.exception('❌ get_weather failed')
-        return jsonify({'error': 'Failed to fetch weather/air pollution data'}), 500
+        return jsonify({'status': 'error', 'message': 'Invalid JSON'}), 400
 
-# -----------------------------
-# UPDATE DAILY AVERAGE VALUES (ppm-aware)
-# Keeps rolling latest 3 days
-# Now stores computed averages directly in MongoDB
-# -----------------------------
-def update_daily_average(data):
-    # use timezone-aware current date (UTC)
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-
-    # ensure numeric values
-    mq2 = safe_float(data.get('mq2_ppm', 0.0))
+    logger.info('📩 Received data: %s', data)
+    
+    mq2_ppm = safe_float(data.get('mq2_ppm', data.get('gas_value', 0.0)))
     temperature = safe_float(data.get('temperature', 0.0))
     humidity = safe_float(data.get('humidity', 0.0))
-    voc = safe_float(data.get('voc_ppm', 0.0))
-    h2s = safe_float(data.get('h2s_ppm', 0.0))
-    co = safe_float(data.get('co_ppm', 0.0))
-    aq = safe_float(data.get('air_quality_percent', 0.0))
+    voc_ppm = safe_float(data.get('voc_ppm', data.get('voc', 0.0)))
+    h2s_ppm = safe_float(data.get('h2s_ppm', data.get('h2s', 0.0)))
+    co_ppm = safe_float(data.get('co_ppm', data.get('co', 0.0)))
+    air_quality_percent = safe_float(data.get('air_quality_percent', data.get('voc_percent', 0.0)))
+    timestamp = datetime.now(timezone.utc)
 
-    # Atomic upsert: increment sums and count, set date on insert
     try:
-        result = avg_collection.update_one(
-            {'date': today},
-            {
-                '$inc': {
-                    'mq2_sum': mq2,
-                    'temperature_sum': temperature,
-                    'humidity_sum': humidity,
-                    'voc_sum': voc,
-                    'h2s_sum': h2s,
-                    'co_sum': co,
-                    'air_quality_sum': aq,
-                    'count': 1
-                },
-                '$setOnInsert': {
-                    'date': today
-                }
-            },
+        sensor_collection.update_one(
+            {'_id': 1},
+            {'$set': {
+                'mq2_ppm': mq2_ppm, 'temperature': temperature, 'humidity': humidity,
+                'voc_ppm': voc_ppm, 'h2s_ppm': h2s_ppm, 'co_ppm': co_ppm,
+                'air_quality_percent': air_quality_percent,
+                'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S %z')
+            }},
             upsert=True
         )
-        
-        # After updating sums, compute and store the actual averages
-        doc = avg_collection.find_one({'date': today})
-        if doc and doc.get('count', 0) > 0:
-            count = doc['count']
-            avg_collection.update_one(
-                {'date': today},
-                {'$set': {
-                    'avg_mq2_ppm': round(doc.get('mq2_sum', 0.0) / count, 3),
-                    'avg_temperature': round(doc.get('temperature_sum', 0.0) / count, 2),
-                    'avg_humidity': round(doc.get('humidity_sum', 0.0) / count, 2),
-                    'avg_voc_ppm': round(doc.get('voc_sum', 0.0) / count, 3),
-                    'avg_h2s_ppm': round(doc.get('h2s_sum', 0.0) / count, 4),
-                    'avg_co_ppm': round(doc.get('co_sum', 0.0) / count, 3),
-                    'avg_air_quality_percent': round(doc.get('air_quality_sum', 0.0) / count, 2)
-                }}
-            )
     except Exception:
-        logger.exception('❌ update_daily_average: failed to upsert')
+        logger.exception('❌ Failed to update latest sensor document')
 
-    # Cleanup keep only latest 3 days (do this safely)
     try:
-        all_docs = list(avg_collection.find().sort('date', -1))
-        if len(all_docs) > 3:
-            for doc in all_docs[3:]:
-                try:
-                    avg_collection.delete_one({'_id': doc['_id']})
-                except Exception:
-                    logger.exception('⚠ Failed to delete old average doc %s', doc.get('_id'))
+        history_doc = {
+            'mq2_ppm': mq2_ppm, 'temperature': temperature, 'humidity': humidity,
+            'voc_ppm': voc_ppm, 'h2s_ppm': h2s_ppm, 'co_ppm': co_ppm,
+            'air_quality_percent': air_quality_percent, 'timestamp': timestamp
+        }
+        history_collection.insert_one(history_doc)
     except Exception:
-        logger.exception('⚠ Failed to cleanup old averages')
+        logger.exception('❌ Failed to insert history doc')
 
-# -----------------------------
-# API: Get Last 3 Days Average Data (FIXED: Returns actual averages, not sums)
-# -----------------------------
+    try:
+        update_daily_average({
+            'mq2_ppm': mq2_ppm, 'temperature': temperature, 'humidity': humidity,
+            'voc_ppm': voc_ppm, 'h2s_ppm': h2s_ppm, 'co_ppm': co_ppm,
+            'air_quality_percent': air_quality_percent
+        })
+    except Exception:
+        logger.exception('❌ update_daily_average failed')
+
+    return jsonify({'status': 'success', 'message': 'Data updated successfully'}), 200
+
+@app.route('/api/viewdata', methods=['GET'])
+def view_data():
+    try:
+        row = sensor_collection.find_one({'_id': 1}, {'_id': 0})
+        return jsonify(row if row else {}), 200
+    except Exception:
+        logger.exception('❌ view_data failed')
+        return jsonify({}), 500
+
+@app.route('/api/alertstatus', methods=['GET'])
+def get_alert():
+    return jsonify(latest_alert), 200
+
+@app.route('/monitor', methods=['GET'])
+def monitor_endpoint():
+    """Flutter app polling endpoint - evaluates alerts in real-time"""
+    try:
+        row = sensor_collection.find_one({'_id': 1})
+        if not row:
+            return jsonify({'alert': False, 'level': 'Good', 'message': 'No sensor data available yet'}), 200
+        
+        alert_flag, level, message = evaluate_alerts(row)
+        logger.info('📱 /monitor checked: alert=%s, level=%s', alert_flag, level)
+        
+        return jsonify({'alert': alert_flag, 'level': level, 'message': message}), 200
+    except Exception:
+        logger.exception('❌ /monitor endpoint failed')
+        return jsonify({'alert': False, 'level': 'Error', 'message': 'Failed to check sensor status'}), 500
+
+@app.route('/monitor_cached', methods=['GET'])
+def monitor_cached():
+    """Returns cached alert status (faster)"""
+    return jsonify(latest_alert), 200
+
 @app.route('/api/viewdailyaverage', methods=['GET'])
 def view_daily_average():
-    """
-    Return last 3 days of daily averages.
-    Computes averages by dividing stored sums by count.
-    If count is missing/zero for a date, fallback to compute from history_collection.
-    """
     try:
         rows_cursor = avg_collection.find({}, {'_id': 0}).sort('date', -1).limit(3)
         rows = list(rows_cursor)
@@ -640,9 +914,7 @@ def view_daily_average():
         for row in rows:
             date_str = row.get('date')
             count = int(row.get('count', 0))
-
             if count > 0:
-                # FIXED: Compute averages by dividing sums by count
                 averages.append({
                     'date': date_str,
                     'avg_mq2_ppm': round(row.get('mq2_sum', 0.0) / count, 3),
@@ -654,63 +926,11 @@ def view_daily_average():
                     'avg_air_quality_percent': round(row.get('air_quality_sum', 0.0) / count, 2),
                     'count': count
                 })
-            else:
-                # fallback to compute the averages from history (safe)
-                if not date_str:
-                    continue
-                start_dt, end_dt = _date_range_from_iso(date_str)
-                # aggregation to compute averages and count
-                pipeline = [
-                    {'$match': {'timestamp': {'$gte': start_dt, '$lt': end_dt}}},
-                    {'$group': {
-                        '_id': None,
-                        'avg_mq2_ppm': {'$avg': '$mq2_ppm'},
-                        'avg_temperature': {'$avg': '$temperature'},
-                        'avg_humidity': {'$avg': '$humidity'},
-                        'avg_voc_ppm': {'$avg': '$voc_ppm'},
-                        'avg_h2s_ppm': {'$avg': '$h2s_ppm'},
-                        'avg_co_ppm': {'$avg': '$co_ppm'},
-                        'avg_air_quality_percent': {'$avg': '$air_quality_percent'},
-                        'count': {'$sum': 1}
-                    }}
-                ]
-                agg = list(history_collection.aggregate(pipeline))
-                if agg:
-                    a = agg[0]
-                    c = int(a.get('count', 0)) or 0
-                    averages.append({
-                        'date': date_str,
-                        'avg_mq2_ppm': round(a.get('avg_mq2_ppm', 0.0) or 0.0, 3),
-                        'avg_temperature': round(a.get('avg_temperature', 0.0) or 0.0, 2),
-                        'avg_humidity': round(a.get('avg_humidity', 0.0) or 0.0, 2),
-                        'avg_voc_ppm': round(a.get('avg_voc_ppm', 0.0) or 0.0, 3),
-                        'avg_h2s_ppm': round(a.get('avg_h2s_ppm', 0.0) or 0.0, 4),
-                        'avg_co_ppm': round(a.get('avg_co_ppm', 0.0) or 0.0, 3),
-                        'avg_air_quality_percent': round(a.get('avg_air_quality_percent', 0.0) or 0.0, 2),
-                        'count': c
-                    })
-                else:
-                    # no history found for that date
-                    averages.append({
-                        'date': date_str,
-                        'avg_mq2_ppm': 0.0,
-                        'avg_temperature': 0.0,
-                        'avg_humidity': 0.0,
-                        'avg_voc_ppm': 0.0,
-                        'avg_h2s_ppm': 0.0,
-                        'avg_co_ppm': 0.0,
-                        'avg_air_quality_percent': 0.0,
-                        'count': 0
-                    })
-
         return jsonify(averages), 200
     except Exception:
         logger.exception('❌ view_daily_average failed')
         return jsonify([]), 500
 
-# -----------------------------
-# View history (last N records)
-# -----------------------------
 @app.route('/api/viewhistory', methods=['GET'])
 def view_history():
     try:
@@ -721,8 +941,7 @@ def view_history():
         cursor = history_collection.find().sort('timestamp', -1).limit(limit)
         data_out = []
         for doc in cursor:
-            ts = doc.get('timestamp')
-            ts = _ensure_tz_aware(ts)
+            ts = _ensure_tz_aware(doc.get('timestamp'))
             ts_str = ts.strftime('%Y-%m-%d %H:%M:%S %z') if ts else ''
             data_out.append({
                 'mq2_ppm': doc.get('mq2_ppm', 0.0),
@@ -739,29 +958,63 @@ def view_history():
         logger.exception('❌ view_history failed')
         return jsonify([]), 500
 
-# -----------------------------
-# Maintenance endpoint: recompute daily averages from history
-# Useful to repair counts/sums if previous logic was incorrect
-# -----------------------------
+@app.route('/get-data-weather', methods=['GET'])
+def get_weather():
+    lat = request.args.get('lat', '16.4821')
+    lon = request.args.get('lon', '80.6914')
+    if not OPENWEATHER_API_KEY:
+        return jsonify({'error': 'OpenWeather API key not configured'}), 400
+    url = 'http://api.openweathermap.org/data/2.5/air_pollution'
+    params = {'lat': lat, 'lon': lon, 'appid': OPENWEATHER_API_KEY}
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        return jsonify(response.json()), 200
+    except Exception:
+        logger.exception('❌ get_weather failed')
+        return jsonify({'error': 'Failed to fetch weather data'}), 500
+
+@app.route('/api/gemini_suggestions', methods=['GET'])
+def gemini_suggestions():
+    try:
+        model = request.args.get('model', GEMINI_MODEL)
+        rows_cursor = avg_collection.find({}, {'_id': 0}).sort('date', -1).limit(3)
+        rows = list(rows_cursor)
+        if not rows:
+            return jsonify({'status': 'error', 'message': 'no daily averages available'}), 404
+        
+        three_days = list(reversed(rows))
+        gemini_resp = call_gemini_for_suggestions(three_days, model=model)
+        
+        human_text = None
+        if isinstance(gemini_resp, dict):
+            if 'text' in gemini_resp:
+                human_text = gemini_resp.get('text')
+        
+        return jsonify({
+            'status': 'success',
+            'model_response': gemini_resp,
+            'human_readable': human_text
+        }), 200
+    except Exception:
+        logger.exception('❌ gemini_suggestions endpoint failed')
+        return jsonify({'status': 'error', 'message': 'internal error'}), 500
+
 @app.route('/api/recompute_daily_averages', methods=['POST'])
 def recompute_daily_averages():
-    """
-    Recompute and overwrite daily_average_ppm documents for the last N days using history_collection.
-    Body: {"days": 7}  (optional, default 7)
-    """
     try:
         body = request.get_json(silent=True) or {}
         days = int(body.get('days', 7))
     except Exception:
         days = 7
-
+    
     try:
         now = datetime.now(timezone.utc)
         for i in range(days):
             day = now - timedelta(days=i)
             date_str = day.strftime('%Y-%m-%d')
             start_dt, end_dt = _date_range_from_iso(date_str)
-
+            
             pipeline = [
                 {'$match': {'timestamp': {'$gte': start_dt, '$lt': end_dt}}},
                 {'$group': {
@@ -779,7 +1032,6 @@ def recompute_daily_averages():
             agg = list(history_collection.aggregate(pipeline))
             if agg and agg[0].get('count', 0) > 0:
                 doc = agg[0]
-                # upsert the sums and count
                 avg_collection.update_one(
                     {'date': date_str},
                     {'$set': {
@@ -795,24 +1047,141 @@ def recompute_daily_averages():
                     upsert=True
                 )
             else:
-                # remove any existing doc if no history for that date
                 avg_collection.delete_one({'date': date_str})
-
+        
         return jsonify({'status': 'success', 'message': f'recomputed last {days} days'}), 200
     except Exception:
         logger.exception('❌ recompute_daily_averages failed')
         return jsonify({'status': 'error', 'message': 'recompute failed'}), 500
-# -----------------------------
+
+# =============================================================================
+# ROUTINE API ENDPOINTS
+# =============================================================================
+
+@app.route('/api/routines/daily', methods=['GET'])
+def get_daily_routines():
+    """Get all configured daily routines"""
+    return jsonify({'status': 'success', 'routines': DAILY_ROUTINES}), 200
+
+@app.route('/api/routines/weekly', methods=['GET'])
+def get_weekly_routines():
+    """Get all configured weekly routines"""
+    return jsonify({'status': 'success', 'routines': WEEKLY_ROUTINES}), 200
+
+@app.route('/api/routines/next', methods=['GET'])
+def get_next_routine():
+    """Get the next scheduled routine"""
+    try:
+        now = datetime.now(TIMEZONE)
+        current_time = now.time()
+        
+        next_routine = None
+        min_diff = None
+        
+        for key, data in DAILY_ROUTINES.items():
+            hour, minute = data['time']
+            routine_time = dt_time(hour, minute)
+            
+            routine_datetime = datetime.combine(now.date(), routine_time)
+            routine_datetime = TIMEZONE.localize(routine_datetime)
+            
+            if routine_time < current_time:
+                routine_datetime = routine_datetime + timedelta(days=1)
+            
+            diff = (routine_datetime - now).total_seconds()
+            
+            if min_diff is None or diff < min_diff:
+                min_diff = diff
+                next_routine = {
+                    'key': key,
+                    'data': data,
+                    'time_until': int(diff / 60),
+                    'scheduled_time': f"{hour:02d}:{minute:02d}"
+                }
+        
+        return jsonify({'status': 'success', 'next_routine': next_routine}), 200
+    except Exception:
+        logger.exception('❌ Failed to get next routine')
+        return jsonify({'status': 'error'}), 500
+
+@app.route('/api/routines/trigger', methods=['POST'])
+def trigger_routine_manually():
+    """Manually trigger a specific routine"""
+    try:
+        data = request.get_json() or {}
+        routine_type = data.get('type', 'daily')
+        routine_key = data.get('key')
+        
+        if not routine_key:
+            return jsonify({'status': 'error', 'message': 'routine key required'}), 400
+        
+        if routine_type == 'daily':
+            if routine_key not in DAILY_ROUTINES:
+                return jsonify({'status': 'error', 'message': 'invalid routine key'}), 400
+            send_routine_notification(routine_key, DAILY_ROUTINES[routine_key])
+        elif routine_type == 'weekly':
+            if routine_key not in WEEKLY_ROUTINES:
+                return jsonify({'status': 'error', 'message': 'invalid routine key'}), 400
+            send_routine_notification(routine_key, WEEKLY_ROUTINES[routine_key])
+        else:
+            return jsonify({'status': 'error', 'message': 'invalid routine type'}), 400
+        
+        return jsonify({'status': 'success', 'message': f'Triggered {routine_key}'}), 200
+    except Exception:
+        logger.exception('❌ Failed to trigger routine')
+        return jsonify({'status': 'error'}), 500
+
+@app.route('/api/routines/history', methods=['GET'])
+def get_routine_history():
+    """Get history of scheduled routines"""
+    try:
+        jobs = []
+        for job in scheduler.get_jobs():
+            if job.id and job.id.startswith('routine_'):
+                jobs.append({
+                    'id': job.id,
+                    'next_run': job.next_run_time.isoformat() if job.next_run_time else None,
+                    'name': job.name
+                })
+        return jsonify({'status': 'success', 'scheduled_jobs': jobs}), 200
+    except Exception:
+        logger.exception('❌ Failed to get routine history')
+        return jsonify({'status': 'error'}), 500
+
+@app.route('/api/send_test_notification', methods=['POST'])
+def send_test_notification():
+    """Send a test notification"""
+    try:
+        data = request.get_json() or {}
+        title = data.get('title', 'Test Notification')
+        body = data.get('body', 'This is a test notification from your IoT system.')
+        level = data.get('level', 'Good')
+        
+        send_fcm_notification(title, body, level)
+        return jsonify({'status': 'success', 'message': 'Test notification sent'}), 200
+    except Exception:
+        logger.exception('❌ Failed to send test notification')
+        return jsonify({'status': 'error', 'message': 'Failed to send notification'}), 500
+
+# =============================================================================
 # MAIN
-# -----------------------------
+# =============================================================================
 if __name__ == '__main__':
     initialize_db()
 
-    # Start monitor thread only once
+    # Start monitor thread
     if not monitor_thread_started.is_set():
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         monitor_thread.start()
         monitor_thread_started.set()
-        logger.info('✅ monitor thread started')
+        logger.info('✅ Monitor thread started')
+
+    # Start scheduler and schedule routines
+    try:
+        schedule_daily_routines()
+        scheduler.start()
+        logger.info('✅ Scheduler started with daily routines')
+    except Exception:
+        logger.exception("⚠️ Failed to start scheduler")
 
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')), debug=True)
