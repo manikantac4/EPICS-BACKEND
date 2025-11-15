@@ -1,32 +1,15 @@
-# Core Flask
-Flask==3.0.3
-flask-cors==4.0.0
-
-# Database
-pymongo==4.10.1
-dnspython==2.7.0
-
-# Firebase Cloud Messaging
-firebase-admin==6.5.0
-
-# HTTP Requests
-requests==2.32.3
-
-# Scheduler for Daily Routines
-APScheduler==3.10.4
-pytz==2024.1
-
-# Gemini AI
-google-generativeai==0.8.3
-
-# Environment Variables
-python-dotenv==1.0.1
-
-# Production Server
+Flask==2.3.2
 gunicorn==23.0.0
-joblib
-scikit-learn
 numpy==1.26.4
 pandas==2.2.2
-tensorflow==2.15.0
+joblib==1.5.2
+scikit-learn==1.7.2
+pymongo==4.10.1
+dnspython==2.7.0
+firebase-admin==6.5.0
+requests==2.32.3
+APScheduler==3.10.4
+pytz==2024.1
+google-generativeai==0.8.3
+python-dotenv==1.0.1
 transformers==4.44.2
