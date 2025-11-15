@@ -24,3 +24,9 @@ python-dotenv==1.0.1
 
 # Production Server
 gunicorn==23.0.0
+joblib
+scikit-learn
+numpy==1.26.4
+pandas==2.2.2
+tensorflow==2.15.0
+transformers==4.44.2
