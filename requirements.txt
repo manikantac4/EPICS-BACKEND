@@ -17,3 +17,6 @@ pytz==2024.1
 google-generativeai==0.8.3
 python-dotenv==1.0.1
 transformers==4.44.2
+tensorflow>=2.13.0
+# or if you need CPU-only version (smaller, faster to install):
+tensorflow-cpu>=2.13.0
