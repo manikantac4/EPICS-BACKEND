@@ -1,24 +1,22 @@
 # ml/mq2_predictor.py
-import math
 from flask import jsonify, request
-from ml.base_predictor import generic_predict_from_mongo
+from ml.ml_base import predict_from_mongo
 
 def predict_mq2_api(history_collection):
     """
-    Predict MQ2 (mq2_ppm). Query param: ?minutes=<int>
+    Predict MQ2 ppm for next N minutes.
     """
     try:
-        minutes = int(request.args.get("minutes", 30))
-        sample_interval = 2  # minutes per step (same as training)
-        steps = max(1, math.ceil(minutes / sample_interval))
+        minutes = int(request.args.get("minutes", 30))   # e.g. /predict_mq2?minutes=30
 
-        result = generic_predict_from_mongo(
+        result = predict_from_mongo(
             history_collection=history_collection,
             target="mq2_ppm",
-            model_dir="./models/mq2 model",
-            steps=steps,
+            minutes=minutes,          # new arg
+            model_dir="./models/mq2_ppm",  # OR None for auto-detect
             lookback=60,
-            sample_interval=sample_interval
+            sample_interval=2,
+            log_target=True
         )
 
         result["requested_minutes"] = minutes
