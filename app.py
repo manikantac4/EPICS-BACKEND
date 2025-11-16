@@ -35,7 +35,7 @@ import logging
 from tensorflow.keras.models import load_model
 import numpy as np
 import pandas as pd 
-from google import genai
+import google.generativeai as genai
 
 from pymongo import MongoClient, ASCENDING
 from dotenv import load_dotenv
