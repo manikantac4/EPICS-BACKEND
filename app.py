@@ -115,7 +115,7 @@ DAILY_ROUTINES = {
         'level': 'Good'
     },
     'midday_refresh': {
-        'time': (11, 0),
+        'time': (11, 13),
         'title': '☀️ Midday Air Refresh',
         'message': 'Short ventilation break (5-10 minutes). Open windows briefly.',
         'tips': [
