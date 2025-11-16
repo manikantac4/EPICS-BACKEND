@@ -7,7 +7,7 @@ pandas>=2.2.3
 
 
 joblib==1.5.2
-scikit-learn==1.7.2
+scikit-learn==1.6.1
 pymongo==4.10.1
 dnspython==2.7.0
 firebase-admin==6.5.0
