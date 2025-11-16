@@ -81,10 +81,10 @@ MONITOR_LOOP_INTERVAL = float(os.getenv('MONITOR_LOOP_INTERVAL', '5'))
 # ALERT THRESHOLDS (ppm / percent)
 # -----------------------------
 THRESHOLDS = {
-    'mq2': { 'moderate': 50.0,  'extreme': 200.0 },
-    'voc': { 'moderate': 300.0, 'extreme': 1000.0 },
+    'mq2': { 'moderate': 20.0,  'extreme': 100.0 },
+    'voc': { 'moderate': 200.0, 'extreme': 500.0 },
     'h2s': { 'moderate': 0.5,   'extreme': 1.5 },
-    'co':  { 'moderate': 35.0,  'extreme': 100.0 },
+    'co':  { 'moderate': 10.0,  'extreme': 50.0 },
     'air_quality_percent': { 'bad_threshold': 60.0 }
 }
 
