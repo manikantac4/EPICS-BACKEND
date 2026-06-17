@@ -172,15 +172,25 @@ def generate():
     id_counter += 1
     return data
 
-while True:
-    data = generate()
-    try:
-        response = requests.post(API_URL, json=data, timeout=10)
+def simulator_loop():
+    while True:
+        data = generate()
 
-        print("=" * 50)
-        print("Sent:", data)
-        print("Status:", response.status_code)
+        try:
+            response = requests.post(API_URL, json=data, timeout=30)
 
-    except Exception as e:
-        print("ERROR:", e)
-    time.sleep(30)
+            print("=" * 50)
+            print("Sent:", data)
+            print("Status:", response.status_code)
+
+            if response.status_code != 200:
+                print("Response:", response.text)
+
+        except Exception as e:
+            print("ERROR:", e)
+
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    simulator_loop()

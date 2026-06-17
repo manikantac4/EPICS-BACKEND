@@ -51,10 +51,7 @@ import pytz
 import threading
 from sensor_simulator import simulator_loop
 
-threading.Thread(
-    target=simulator_loop,
-    daemon=True
-).start()
+
 # Optional: firebase import guarded
 firebase_available = False
 try:
@@ -1002,6 +999,10 @@ def send_test_notification():
 # MAIN
 # =============================================================================
 if __name__ == '__main__':
+    threading.Thread(
+    target=simulator_loop,
+    daemon=True
+).start()
     initialize_db()
 
     # Start monitor thread
