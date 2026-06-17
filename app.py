@@ -48,7 +48,13 @@ from ml.temperature import predict_temperature_api
 # APScheduler for scheduled notifications
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
+import threading
+from sensor_simulator import simulator_loop
 
+threading.Thread(
+    target=simulator_loop,
+    daemon=True
+).start()
 # Optional: firebase import guarded
 firebase_available = False
 try:
