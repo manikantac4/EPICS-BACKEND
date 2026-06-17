@@ -3,7 +3,7 @@ import random
 import time
 from datetime import datetime, timezone
 
-API_URL = "https://epics-backend.onrender.com/api/sensordata"
+API_URL = "https://epics-backend-fvbf.onrender.com/api/sensordata"
 
 id_counter = 1
 
