@@ -220,9 +220,13 @@ try:
     sensor_collection = db['sensor_snapshot']
     avg_collection = db['daily_average_ppm']
     history_collection = db['sensor_history_ppm']
+    esp32_collection = db['esp32_sensor_data']
+    esp32_history_collection = db['esp32_history']
     history_collection.create_index([('timestamp', ASCENDING)])
     avg_collection.create_index([('date', ASCENDING)])
     sensor_collection.create_index([('_id', ASCENDING)])
+    esp32_collection.create_index([('_id', ASCENDING)])
+    esp32_history_collection.create_index([('history_timestamp', ASCENDING)])
     logger.info('✅ Connected to MongoDB and indexes ensured')
 except Exception as e:
     logger.exception('❌ Failed to connect to MongoDB')
@@ -554,6 +558,25 @@ def initialize_db():
     except Exception:
         logger.exception('❌ initialize_db failed')
 
+    try:
+        if esp32_collection.count_documents({}) == 0:
+            esp32_collection.insert_one({
+                '_id': 1,
+                'device_id': 'ESP32_OMX44',
+                'mq2_ppm': 0.0,
+                'mq2_raw': 0,
+                'temperature': 0.0,
+                'humidity': 0.0,
+                'led_status': 'OFF',
+                'buzzer_status': 'OFF',
+                'sensor_fault': False,
+                'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %z'),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            })
+            logger.info('✅ MongoDB ready with initial esp32 document')
+    except Exception:
+        logger.exception('❌ initialize_db for esp32 failed')
+
 # -----------------------------
 # DAILY AVERAGE UPDATE
 # -----------------------------
@@ -700,7 +723,162 @@ def receive_data():
     except Exception:
         logger.exception('❌ update_daily_average failed')
 
+    # If payload contains ESP32 hardware states, store in esp32 collections too
+    if any(k in data for k in ('led_status', 'buzzer_status', 'mq2_raw', 'device_id', 'sensor_fault')):
+        try:
+            esp32_doc = {
+                'device_id': str(data.get('device_id', 'ESP32_OMX44')),
+                'mq2_ppm': mq2_ppm,
+                'mq2_raw': int(safe_float(data.get('mq2_raw', 0))),
+                'temperature': temperature,
+                'humidity': humidity,
+                'led_status': str(data.get('led_status', 'OFF')).upper(),
+                'buzzer_status': str(data.get('buzzer_status', 'OFF')).upper(),
+                'sensor_fault': bool(data.get('sensor_fault', False)),
+                'timestamp': str(data.get('timestamp', timestamp.strftime('%Y-%m-%d %H:%M:%S %z'))),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+            esp32_collection.update_one({'_id': 1}, {'$set': esp32_doc}, upsert=True)
+            esp32_history_collection.insert_one(dict(esp32_doc, history_timestamp=datetime.now(timezone.utc)))
+        except Exception:
+            logger.exception('❌ Failed to update esp32 collection from /api/sensordata')
+
     return jsonify({'status': 'success', 'message': 'Data updated successfully'}), 200
+
+# =============================================================================
+# ESP32 HARDWARE DEVICE ENDPOINTS
+# Storing & retrieving raw sensor readings (MQ2, Temperature) & actuator states (Buzzer, LED)
+# No threshold checks in backend - ESP32 handles alert triggers on hardware
+# =============================================================================
+
+@app.route('/api/esp32/sensordata', methods=['POST'])
+def receive_esp32_data():
+    """
+    Dedicated endpoint for ESP32 Multi-sensor IoT System.
+    Stores raw values (MQ2, Temperature, Humidity) and actuator states (LED, Buzzer)
+    without backend threshold checking.
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({'status': 'error', 'message': 'Invalid JSON'}), 400
+
+    logger.info('📩 [ESP32] Received data: %s', data)
+
+    device_id = str(data.get('device_id', 'ESP32_OMX44'))
+    mq2_ppm = safe_float(data.get('mq2_ppm', data.get('gas_value', 0.0)))
+    mq2_raw = int(safe_float(data.get('mq2_raw', 0)))
+    temperature = safe_float(data.get('temperature', 0.0))
+    humidity = safe_float(data.get('humidity', 0.0))
+    led_status = str(data.get('led_status', 'OFF')).upper()
+    buzzer_status = str(data.get('buzzer_status', 'OFF')).upper()
+    sensor_fault = bool(data.get('sensor_fault', False))
+    raw_timestamp = data.get('timestamp')
+    timestamp_str = str(raw_timestamp) if raw_timestamp else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %z')
+
+    esp32_doc = {
+        'device_id': device_id,
+        'mq2_ppm': mq2_ppm,
+        'mq2_raw': mq2_raw,
+        'temperature': temperature,
+        'humidity': humidity,
+        'led_status': led_status,
+        'buzzer_status': buzzer_status,
+        'sensor_fault': sensor_fault,
+        'timestamp': timestamp_str,
+        'updated_at': datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        esp32_collection.update_one(
+            {'_id': 1},
+            {'$set': esp32_doc},
+            upsert=True
+        )
+    except Exception:
+        logger.exception('❌ Failed to update esp32 snapshot')
+
+    try:
+        history_doc = dict(esp32_doc)
+        history_doc['history_timestamp'] = datetime.now(timezone.utc)
+        esp32_history_collection.insert_one(history_doc)
+    except Exception:
+        logger.exception('❌ Failed to insert esp32 history')
+
+    # Also update sensor_snapshot mq2, temperature, humidity for general compatibility
+    try:
+        sensor_collection.update_one(
+            {'_id': 1},
+            {'$set': {
+                'mq2_ppm': mq2_ppm,
+                'temperature': temperature,
+                'humidity': humidity,
+                'timestamp': timestamp_str
+            }},
+            upsert=True
+        )
+    except Exception:
+        pass
+
+    return jsonify({
+        'status': 'success',
+        'message': 'ESP32 data stored successfully',
+        'data': esp32_doc
+    }), 200
+
+@app.route('/api/esp32/latest', methods=['GET'])
+@app.route('/api/esp32/data', methods=['GET'])
+def get_esp32_latest():
+    """
+    Returns latest stored reading and actuator states from the ESP32.
+    """
+    try:
+        row = esp32_collection.find_one({'_id': 1}, {'_id': 0})
+        if not row:
+            fallback = sensor_collection.find_one({'_id': 1}, {'_id': 0}) or {}
+            row = {
+                'device_id': 'ESP32_OMX44',
+                'mq2_ppm': safe_float(fallback.get('mq2_ppm', 0.0)),
+                'mq2_raw': 0,
+                'temperature': safe_float(fallback.get('temperature', 0.0)),
+                'humidity': safe_float(fallback.get('humidity', 0.0)),
+                'led_status': 'OFF',
+                'buzzer_status': 'OFF',
+                'sensor_fault': False,
+                'timestamp': fallback.get('timestamp', datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %z')),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+        return jsonify({
+            'status': 'success',
+            'data': row
+        }), 200
+    except Exception:
+        logger.exception('❌ get_esp32_latest failed')
+        return jsonify({
+            'status': 'error',
+            'message': 'Failed to retrieve ESP32 data'
+        }), 500
+
+@app.route('/api/esp32/history', methods=['GET'])
+def get_esp32_history():
+    """
+    Returns history of readings from ESP32.
+    """
+    try:
+        limit = int(request.args.get('limit', 50))
+    except Exception:
+        limit = 50
+    try:
+        cursor = esp32_history_collection.find({}, {'_id': 0, 'history_timestamp': 0}).sort('history_timestamp', -1).limit(limit)
+        items = list(cursor)
+        return jsonify({
+            'status': 'success',
+            'count': len(items),
+            'history': items
+        }), 200
+    except Exception:
+        logger.exception('❌ get_esp32_history failed')
+        return jsonify({'status': 'error', 'history': []}), 500
 
 @app.route('/api/viewdata', methods=['GET'])
 def view_data():
